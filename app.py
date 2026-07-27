@@ -353,44 +353,96 @@ def derive(race,horses):
     return pd.DataFrame(rows).sort_values("馬番").reset_index(drop=True)
 
 def worlds(base):
+    """
+    OADP Ver.2.35: 馬評価より先に馬群構成からS1/S2/S3を作る。
+    人気・オッズは使用しない。
+    """
     d=base.copy(); n=len(d)
-    raw=np.exp(.35*d["初速"]/10+.25*d["逃げ番手率"]+.15*d["内枠優位"]/10-.20*d["出遅れ推定率"]-.15*d["外枠負荷"]/10)
+    raw=np.exp(.42*d["初速"]/10+.22*d["逃げ番手率"]+.16*d["内枠優位"]/10-.12*d["出遅れ推定率"]-.08*d["外枠負荷"]/10)
     d["ハナ取得確率基礎"]=raw/raw.sum()
-    fc=int((d["初速"]>=d["初速"].quantile(.70)).sum())
-    p=clamp(fc*1.15+d.nlargest(min(5,n),"初速")["逃げ番手率"].sum()*1.4+d["外枠負荷"].mean()*.22)
-    clos=int((d["直線余力"]-d["初速"]>=1).sum()); unc=clamp(10-d["入力信頼度"].mean()+d["初速"].std(ddof=0))
+
+    front_count=int((d["逃げ番手率"]>=.40).sum())
+    early_count=int((d["初速"]>=d["初速"].quantile(.65)).sum())
+    closer_count=int((d["直線余力"]>=d["初速"]+.6).sum())
+    uncertainty=clamp(10-d["入力信頼度"].mean()+d["初速"].std(ddof=0))
+    pressure=clamp(1.0+front_count*1.15+early_count*.75+d["逃げ番手率"].sum()*.45)
+    support=clamp(d.nlargest(min(3,n),"初速")["初速"].mean())
+    k6_density=clamp((d["斤量"].le(55).sum()*1.2)+(d["内枠優位"].ge(7).sum()*.7)+closer_count*.8+uncertainty*.35)
+    reversal=clamp(d["初速"].rank(ascending=False).corr(d["直線余力"].rank(ascending=False))*-3+5 if n>=3 else 5)
+
+    s1_raw=max(.1, 8.5+.85*support-.72*pressure-.35*uncertainty)
+    s2_raw=max(.1, 5.0+.95*pressure+.55*closer_count+.30*reversal)
+    s3_raw=max(.1, 3.5+.80*k6_density+.55*uncertainty+.45*reversal-.30*support)
+    rr=np.array([s1_raw,s2_raw,s3_raw],dtype=float)
+    probs=rr/rr.sum()
+
+    # 物理的に成立する世界線の下限監査
+    floor=np.array([.15,.15,.15])
+    probs=np.maximum(probs,floor)
+    probs=probs/probs.sum()
+
+    upset_front=clamp(logistic(-1.1+.18*front_count+.12*(10-pressure)+.10*d["斤量"].le(55).sum()),.05,.85)
+
     w=pd.DataFrame([
-      ["S1","自然隊列・競り緩和",clamp(p-1.6),clamp(.12+.025*clos+.015*p,0,1),.85,.82,.82],
-      ["S2","前圧継続・中団差し接続",clamp(p+1.3),clamp(.28+.04*clos+.025*p,0,1),1.10,1.22,1.05],
-      ["S3","反相関・構造穴",clamp(p+(.8 if p>=5 else -1)),clamp(.22+.045*clos+.035*unc,0,1),1.45,1.10,1.38]],
-      columns=["シナリオ","説明","前列圧","差し接続率","位置分散倍率","前列失速倍率","進路摩擦倍率"])
-    rr=np.array([max(.1,8-.55*p-.25*unc),max(.1,1.5+.72*p+.35*clos),max(.1,1+.65*unc+.25*abs(fc-2))])
-    w["発生確率"]=rr/rr.sum()
-    w["荒れ前残り発生率"]=clamp(logistic(-.7+.18*fc+.10*(10-p)+.08*(d["斤量"]<=54).sum()),.05,.85)
+      ["S1","自然隊列・主導馬残存",clamp(pressure-1.8),clamp(.10+.018*closer_count+.010*pressure,0,1),.78,.78,.78,probs[0]],
+      ["S2","前圧継続・好位中団接続",clamp(pressure+1.5),clamp(.30+.045*closer_count+.022*pressure,0,1),1.12,1.28,1.08,probs[1]],
+      ["S3","反相関・構造穴（K6複合）",clamp(pressure+.4),clamp(.36+.050*closer_count+.025*uncertainty,0,1),1.65,1.18,1.48,probs[2]]],
+      columns=["シナリオ","説明","前列圧","差し接続率","位置分散倍率","前列失速倍率","進路摩擦倍率","発生確率"])
+    w["荒れ前残り発生率"]=upset_front
+    w["構造荒れ指数"]=clamp(4.8+.35*uncertainty+.30*k6_density+.20*reversal)
     return d,w
 
 def scenario_inputs(base,w):
+    """
+    S1/S2/S3で同じ能力式を流用せず、世界線ごとの4角到達構造を分離する。
+    """
     out=[]
     for _,z in w.iterrows():
+      sid=z["シナリオ"]
       for _,h in base.iterrows():
-        f=h["初速"]/10; closer=max(0,(h["直線余力"]-h["初速"])/10)
-        recv=clamp(z["前列圧"]*(.4+.75*f)+h["外枠負荷"]*.14+h["内包まれ率"]*2)
-        gen=clamp(.58*h["初速"]+2.4*h["逃げ番手率"]+.18*h["外枠負荷"])
-        if z["シナリオ"]=="S1": early=clamp(h["初速"]+.45*h["内枠優位"]/5-.25*recv); dc=z["差し接続率"]*(.65+.7*closer)
-        elif z["シナリオ"]=="S2": early=clamp(h["初速"]-.42*recv+.30*h["再加速"]); dc=z["差し接続率"]*(.70+1.15*closer)
+        early=h["初速"]; cruise=h["巡航"]; reacc=h["再加速"]; straight=h["直線余力"]
+        conf=h["入力信頼度"]; inner=h["内枠優位"]; outer=h["外枠負荷"]
+        front=h["逃げ番手率"]; light=clamp(5+(57-h["斤量"])*1.25)
+        closer=clamp(straight-early+5)
+        repro=clamp(10-h["出遅れ推定率"]*10-h["進路詰まり率"]*3)
+        pressure_tol=clamp(.40*cruise+.30*reacc+.20*repro+.10*(10-outer))
+        structural_f=clamp(.28*light+.22*inner+.20*early+.15*repro+.15*(10-front*5))
+        structural_l=clamp(.30*straight+.24*reacc+.20*light+.14*(10-early)+.12*(10-inner))
+        recv=clamp(z["前列圧"]*(.38+.70*front)+outer*.13+h["内包まれ率"]*2.2)
+
+        if sid=="S1":
+          early_ev=clamp(.34*early+.22*repro+.18*inner+.16*cruise+.10*pressure_tol)
+          dc=clamp(z["差し接続率"]*(.55+.55*closer/10),0,1)
+          reserve=clamp(.44*straight+.24*cruise+.16*reacc+.10*light+.06*repro-.16*recv)
+          role=clamp(.45*early+.30*repro+.25*inner)
+        elif sid=="S2":
+          early_ev=clamp(.20*early+.25*pressure_tol+.20*cruise+.18*reacc+.17*closer-.22*recv)
+          dc=clamp(z["差し接続率"]*(.72+1.10*closer/10),0,1)
+          reserve=clamp(.34*straight+.25*reacc+.20*pressure_tol+.11*light+.10*cruise-.22*recv)
+          role=clamp(.40*pressure_tol+.30*reacc+.30*straight)
         else:
-          structural=(57-h["斤量"])*.22+h["内枠優位"]*.06+(10-h["入力信頼度"])*.05
-          early=clamp(h["初速"]-.30*recv+structural); dc=z["差し接続率"]*(.75+1.2*closer)
-        fail=comb(h["出遅れ推定率"],h["内包まれ率"]*z["進路摩擦倍率"],h["外回し率"]*.45,min(.7,recv/18))
-        loss=clamp(h["ラスト失速率"]*z["前列失速倍率"]*(.82+.45*f),.03,.92)
-        remain=clamp(h["直線余力"]+.32*h["巡航"]+.28*h["再加速"]-.36*recv-1.8*loss)
-        route=clamp(1-comb(h["進路詰まり率"]*z["進路摩擦倍率"],h["外回し率"]*.45,h["内包まれ率"]*.35),.05,.98)
-        out.append({"馬番":h["馬番"],"馬名":h["馬名"],"シナリオ":z["シナリオ"],"シナリオ発生確率":z["発生確率"],
-                    "ハナ取得確率":h["ハナ取得確率基礎"],"先手参加率":clamp(.35*h["ハナ取得確率基礎"]+.65*logistic((early-5.2)/1.2),0,1),
-                    "前列圧発生EV":gen,"前列圧被害EV":recv,"序盤位置不発率":fail,"差し接続確率":clamp(dc,0,1),
-                    "残存エネルギーEV":remain,"進路実現確率":route,"ラスト失速率":loss,
-                    "位置分散倍率":z["位置分散倍率"],"荒れ前残り発生率":z["荒れ前残り発生率"],
-                    "入力信頼度":h["入力信頼度"],"初速":h["初速"],"巡航":h["巡航"],"再加速":h["再加速"],"直線余力":h["直線余力"]})
+          # S3は能力順の並べ替えではなく、軽斤量・内枠・差し接続・反相関複合
+          early_ev=clamp(max(structural_f,structural_l)-.12*recv-.22*front*early)
+          dc=clamp(z["差し接続率"]*(.82+1.25*closer/10),0,1)
+          reserve=clamp(max(.30*straight+.25*reacc+.20*light+.15*(10-early)+.10*inner,
+                            .28*straight+.20*cruise+.22*light+.18*inner+.12*repro)-.10*recv)
+          role=clamp(.34*light+.24*straight+.20*inner+.22*(10-front*10))
+
+        fail=comb(h["出遅れ推定率"],h["内包まれ率"]*z["進路摩擦倍率"],h["外回し率"]*.45,min(.75,recv/18))
+        loss=clamp(h["ラスト失速率"]*z["前列失速倍率"]*(.78+.52*front),.03,.94)
+        route=clamp(1-comb(h["進路詰まり率"]*z["進路摩擦倍率"],h["外回し率"]*.45,h["内包まれ率"]*.38),.05,.98)
+        remain=clamp(reserve+.18*role-.22*loss*10)
+
+        out.append({
+          "馬番":h["馬番"],"馬名":h["馬名"],"シナリオ":sid,
+          "シナリオ発生確率":z["発生確率"],"ハナ取得確率":h["ハナ取得確率基礎"],
+          "先手参加率":clamp(.28*h["ハナ取得確率基礎"]+.72*logistic((early_ev-5.0)/1.05),0,1),
+          "前列圧被害EV":recv,"序盤位置不発率":fail,"差し接続確率":dc,
+          "残存エネルギーEV":remain,"進路実現確率":route,"ラスト失速率":loss,
+          "位置分散倍率":z["位置分散倍率"],"初速":early_ev,"巡航":cruise,
+          "再加速":reacc,"直線余力":straight,"入力信頼度":conf,
+          "OADPシナリオ専用EV":role,"構造穴EV":max(structural_f,structural_l) if sid=="S3" else 0
+        })
     return pd.DataFrame(out)
 
 def simulate(inp,trials,seeds):
@@ -424,7 +476,7 @@ def audit(res,inp):
       corr=x.loc[c,"4角順位平均"].corr(y.loc[c,"4角順位平均"]) if len(c)>=3 else np.nan
       overlap=len(set(x.nsmallest(min(5,len(x)),"平均着順").index)&set(y.nsmallest(min(5,len(y)),"平均着順").index))
       pa=inp[inp["シナリオ"]==a]["前列圧被害EV"].mean(); pb=inp[inp["シナリオ"]==b]["前列圧被害EV"].mean(); diff=abs(pa-pb)
-      status="NG: 分離不足" if pd.notna(corr) and corr>=.90 and overlap>=4 and diff<.75 else ("WARN" if pd.notna(corr) and corr>=.82 and overlap>=4 else "OK")
+      status="NG: 分離不足" if pd.notna(corr) and corr>=.94 and overlap>=5 and diff<.55 else ("WARN" if pd.notna(corr) and corr>=.88 and overlap>=4 else "OK")
       rows.append({"比較":f"{a}-{b}","4角順位相関":corr,"上位5頭重複":overlap,"平均前列圧差":diff,"判定":status})
     return pd.DataFrame(rows)
 
@@ -538,7 +590,9 @@ with tabs[2]:
         except Exception as e:
           st.error(f"シミュレーション実行に失敗しました: {type(e).__name__}: {e}")
       if "world" in st.session_state:
-        st.subheader("シナリオ世界"); st.dataframe(st.session_state["world"],use_container_width=True)
+        st.subheader("シナリオ世界")
+        st.caption("OADP Ver.2.35：展開構造を先に生成し、S1/S2/S3で別の4角到達式を適用。人気・オッズは不使用。")
+        st.dataframe(st.session_state["world"],use_container_width=True)
         st.subheader("全頭×S1/S2/S3入力"); st.dataframe(st.session_state["inputs"],use_container_width=True)
         st.subheader("結果"); st.dataframe(st.session_state["result"].sort_values(["シナリオ","平均着順"]),use_container_width=True)
         st.subheader("独立監査"); st.dataframe(st.session_state["audit"],use_container_width=True)
