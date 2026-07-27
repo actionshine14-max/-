@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_VERSION="0.1.1-fixed"
+APP_VERSION="0.1.2-jra-tab-fixed"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -57,38 +57,86 @@ def _clean_lines(text):
     return [re.sub(r"[ \\t\\u3000]+"," ",x).strip() for x in text.replace("\\r\\n","\\n").replace("\\r","\\n").split("\\n")]
 
 def _horse_blocks_flexible(text):
-    """JRAコピー形式の空行・全角空白・枠表記揺れに耐える馬ブロック抽出。"""
+    """
+    JRA出馬表コピー形式に対応する馬ブロック抽出。
+
+    対応例:
+      枠1白    1
+      枠2黒    2
+      枠3赤
+      3
+      1枠 白 1
+
+    タブは事前に半角スペースへ正規化されるため、
+    「枠1白<TAB>1」が1行に残るケースも処理する。
+    """
     lines=_clean_lines(text)
     starts=[]
+
+    start_re=re.compile(
+        r"^(?:"
+        r"枠\\s*(?P<frame1>\\d+)\\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\\s*(?P<num1>\\d{1,2})?"
+        r"|"
+        r"(?P<frame2>\\d+)\\s*枠\\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\\s*(?P<num2>\\d{1,2})?"
+        r")$"
+    )
+
     for i,line in enumerate(lines):
-        m=re.fullmatch(r"(?:枠\\s*(\\d+)|(\\d+)\\s*枠)",line)
-        if m:
-            starts.append((i,int(m.group(1) or m.group(2))))
+        m=start_re.fullmatch(line)
+        if not m:
+            continue
+        frame=int(m.group("frame1") or m.group("frame2"))
+        inline_num=m.group("num1") or m.group("num2")
+        starts.append((i,frame,int(inline_num) if inline_num else None))
+
     blocks=[]
-    for j,(idx,frame) in enumerate(starts):
+    for j,(idx,frame,inline_num) in enumerate(starts):
         end=starts[j+1][0] if j+1<len(starts) else len(lines)
         seg=lines[idx:end]
-        number=None; number_i=None
-        for k,line in enumerate(seg[1:14],start=1):
-            if re.fullmatch(r"\\d{1,2}",line):
-                v=int(line)
-                if 1<=v<=30:
-                    number=v; number_i=k; break
+
+        number=inline_num
+        number_i=0 if inline_num is not None else None
+
+        if number is None:
+            for k,line in enumerate(seg[1:16],start=1):
+                if re.fullmatch(r"\\d{1,2}",line):
+                    v=int(line)
+                    if 1<=v<=30:
+                        number=v
+                        number_i=k
+                        break
+
         if number is None:
             continue
+
+        search_from=1 if number_i==0 else number_i+1
         name=None
-        skip_words=("ブリンカー着用","取消","除外","競走除外")
-        for line in seg[number_i+1:number_i+10]:
+        skip_words={
+            "ブリンカー着用","取消","除外","競走除外",
+            "勝負服の画像","馬柱の見方","着順で色分け","同一レースで色分け"
+        }
+
+        for line in seg[search_from:search_from+14]:
             if not line or line in skip_words:
                 continue
-            if re.fullmatch(r"(牡|牝|せん)\\d+",line): continue
-            if re.fullmatch(r"\\d{2}(?:\\.\\d)?kg",line): continue
-            if re.fullmatch(r"\\d+(?:\\.\\d+)?",line): continue
-            if re.fullmatch(r"\\(\\d+番人気\\)",line): continue
-            name=line
+            if re.fullmatch(r"(牡|牝|せん)\\d+(?:/.*)?",line):
+                continue
+            if re.fullmatch(r"\\d{2}(?:\\.\\d)?kg",line):
+                continue
+            if re.fullmatch(r"\\d+(?:\\.\\d+)?",line):
+                continue
+            if re.fullmatch(r"\\(\\d+番人気\\)",line):
+                continue
+            if re.fullmatch(r"\\d{3}kg\\((?:初出走|[+-]?\\d+)\\)",line):
+                continue
+            if line.startswith("枠") and "馬番" in line:
+                continue
+            name=line.strip()
             break
+
         if name:
             blocks.append((frame,number,name,"\\n".join(seg)))
+
     return blocks
 
 def _horse_blocks(text):
@@ -136,7 +184,7 @@ def parse_text(text):
     horses=sorted(horses,key=lambda x:x["number"])
     race["field_size"]=len(horses)
     if not horses:
-        warns.append("馬ブロックを抽出できませんでした。入力形式を確認してください。基礎数値生成は実行されません。")
+        warns.append("馬ブロックを抽出できませんでした。枠見出しが「枠1白 1」のように含まれているか確認してください。基礎数値生成は実行されません。")
     return race,horses,warns
 
 def validate_base(df):
