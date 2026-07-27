@@ -69,3 +69,13 @@ v0.1.2では、正規表現中の `\s`、`\d`、タブ・改行正規化文字�
 地方競馬URLの例:
 
 `https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2F07%2F26&k_raceNo=12&k_babaCode=10`
+
+
+## v0.2.1 修正内容
+
+- シミュレーション実行中の進捗表示を追加
+- 完了後に `st.rerun()` して結果表示を確実化
+- Session Stateをキー単位で保存
+- 入力件数・結果件数の整合性検査を追加
+- 失敗時にPythonトレースバックを画面表示
+- 前回結果を消去してから再実行
