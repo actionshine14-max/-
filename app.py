@@ -1,13 +1,16 @@
 
 from __future__ import annotations
 import json, math, re
+import requests
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import Any
 import numpy as np
 import pandas as pd
 import streamlit as st
+from oadp_engine import parse_nar_html
 
-APP_VERSION="0.1.2-jra-tab-fixed"
+APP_VERSION="0.2.0-step0-parser-integrated"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -35,6 +38,100 @@ BW=re.compile(r"(\d{3})kg\((初出走|[+-]\d+|0)\)")
 ODDS=re.compile(r"(\d+(?:\.\d+)?)\s*\n\((\d+)番人気\)")
 LOAD=re.compile(r"(\d{2}\.\d)kg")
 
+
+def fetch_nar_html(race_url):
+    """
+    STEP0作成アプリ v3.8 と同じ考え方で地方競馬公式URLを取得する。
+    SSRF対策として http/https と keiba.go.jp 系だけを許可する。
+    """
+    url = (race_url or "").strip()
+    if not url:
+        raise ValueError("URLが空です。")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("正しいhttp/https URLを入力してください。")
+    host = (parsed.hostname or "").lower()
+    if not (host == "keiba.go.jp" or host.endswith(".keiba.go.jp")):
+        raise ValueError("地方競馬公式 keiba.go.jp の出馬表URLを入力してください。")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; OADPSimulator/0.2)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.7,en;q=0.5",
+        "Cache-Control": "no-cache",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
+    except requests.RequestException as e:
+        raise ValueError(f"URL取得に失敗しました: {e}") from e
+
+    if resp.status_code >= 400:
+        raise ValueError(f"URL取得に失敗しました: HTTP {resp.status_code}")
+    if not resp.encoding or resp.encoding.lower() in {"iso-8859-1", "ascii"}:
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    html = resp.text
+    if len(html.strip()) < 500:
+        raise ValueError("取得HTMLが短すぎます。出馬表公開前、URL誤り、またはアクセス制限の可能性があります。")
+    return html
+
+
+def nar_race_to_sim_input(race_obj):
+    """
+    STEP0作成アプリの parse_nar_html() が返す Race/Horse/PastRun を
+    本シミュレーター共通入力へ変換する。
+    """
+    course_text = str(getattr(race_obj, "course", "") or "")
+    surface = "turf" if "芝" in course_text else "dirt"
+    race = {
+        "date": str(getattr(race_obj, "date_text", "") or ""),
+        "track": str(getattr(race_obj, "track", "") or ""),
+        "race_no": getattr(race_obj, "race_no", None),
+        "title": str(getattr(race_obj, "title", "") or ""),
+        "distance": getattr(race_obj, "distance", None),
+        "surface": surface,
+        "direction": str(getattr(race_obj, "direction", "") or ""),
+        "weather": str(getattr(race_obj, "weather", "") or ""),
+        "going": str(getattr(race_obj, "going", "") or ""),
+        "field_size": len(getattr(race_obj, "horses", []) or []),
+        "source": "NAR_URL_STEP0_PARSER",
+    }
+
+    horses = []
+    for h in getattr(race_obj, "horses", []) or []:
+        runs = []
+        for r in getattr(h, "past_runs", []) or []:
+            pos = list(getattr(r, "passing_positions", []) or [])
+            course = str(getattr(r, "course", "") or "")
+            runs.append({
+                "date": str(getattr(r, "date", "") or ""),
+                "distance": getattr(r, "distance", None),
+                "surface": "turf" if "芝" in course else ("dirt" if course else None),
+                "finish": getattr(r, "rank", None),
+                "field_size": getattr(r, "heads", None),
+                "positions": pos,
+                "up3f": getattr(r, "agari", None),
+            })
+
+        horses.append({
+            "frame": getattr(h, "frame_no", None),
+            "number": getattr(h, "horse_no", None),
+            "name": str(getattr(h, "name", "") or ""),
+            "load": getattr(h, "carried_weight", None),
+            "body_weight": getattr(h, "body_weight", None),
+            "body_weight_delta": getattr(h, "body_weight_diff", None),
+            "debut": len(runs) == 0,
+            "blinker": "ブリンカー" in str(getattr(h, "equipment_notes", "") or ""),
+            "odds": getattr(h, "odds", None),
+            "popularity": getattr(h, "popularity", None),
+            "runs": runs,
+            "jockey": str(getattr(h, "jockey", "") or ""),
+            "trainer": str(getattr(h, "trainer", "") or ""),
+            "sex_age": str(getattr(h, "sex_age", "") or ""),
+            "source_type": "FACT",
+        })
+    return race, horses
+
+
 def parse_runs(block):
     ds=list(DATE.finditer(block)); out=[]
     for i,m in enumerate(ds):
@@ -54,88 +151,105 @@ def parse_runs(block):
 
 
 def _clean_lines(text):
-    return [re.sub(r"[ \\t\\u3000]+"," ",x).strip() for x in text.replace("\\r\\n","\\n").replace("\\r","\\n").split("\\n")]
+    """
+    改行・タブ・全角空白・NBSPを正規化する。
+    splitlines()を使うことでWindows/Unix/Mac改行を同時に処理する。
+    """
+    if text is None:
+        return []
+    normalized = (
+        str(text)
+        .replace("\ufeff", "")
+        .replace("\u00a0", " ")
+        .replace("\u200b", "")
+    )
+    return [
+        re.sub(r"[ \t\u3000]+", " ", line).strip()
+        for line in normalized.splitlines()
+    ]
+
 
 def _horse_blocks_flexible(text):
     """
-    JRA出馬表コピー形式に対応する馬ブロック抽出。
+    JRA出馬表コピー形式の枠・馬番・馬名を抽出する。
 
-    対応例:
-      枠1白    1
-      枠2黒    2
-      枠3赤
-      3
+    対応形式:
+      枠1白<TAB>1
+      枠1白 1
+      枠1白
+      1
       1枠 白 1
 
-    タブは事前に半角スペースへ正規化されるため、
-    「枠1白<TAB>1」が1行に残るケースも処理する。
+    ブリンカー着用が馬名の前に挿入されても処理する。
     """
-    lines=_clean_lines(text)
-    starts=[]
+    lines = _clean_lines(text)
+    starts = []
 
-    start_re=re.compile(
+    # 枠色が枠番号へ直結する形式を含む。
+    start_re = re.compile(
         r"^(?:"
-        r"枠\\s*(?P<frame1>\\d+)\\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\\s*(?P<num1>\\d{1,2})?"
+        r"枠\s*(?P<frame1>\d+)\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\s*(?P<num1>\d{1,2})?"
         r"|"
-        r"(?P<frame2>\\d+)\\s*枠\\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\\s*(?P<num2>\\d{1,2})?"
+        r"(?P<frame2>\d+)\s*枠\s*(?:白|黒|赤|青|黄|緑|橙|桃)?\s*(?P<num2>\d{1,2})?"
         r")$"
     )
 
-    for i,line in enumerate(lines):
-        m=start_re.fullmatch(line)
+    for i, line in enumerate(lines):
+        m = start_re.fullmatch(line)
         if not m:
             continue
-        frame=int(m.group("frame1") or m.group("frame2"))
-        inline_num=m.group("num1") or m.group("num2")
-        starts.append((i,frame,int(inline_num) if inline_num else None))
+        frame = int(m.group("frame1") or m.group("frame2"))
+        inline_num = m.group("num1") or m.group("num2")
+        starts.append((i, frame, int(inline_num) if inline_num else None))
 
-    blocks=[]
-    for j,(idx,frame,inline_num) in enumerate(starts):
-        end=starts[j+1][0] if j+1<len(starts) else len(lines)
-        seg=lines[idx:end]
+    blocks = []
+    for j, (idx, frame, inline_num) in enumerate(starts):
+        block_end = starts[j + 1][0] if j + 1 < len(starts) else len(lines)
+        seg = lines[idx:block_end]
 
-        number=inline_num
-        number_i=0 if inline_num is not None else None
+        number = inline_num
+        number_i = 0 if inline_num is not None else None
 
+        # 馬番が次行へ分離された形式
         if number is None:
-            for k,line in enumerate(seg[1:16],start=1):
-                if re.fullmatch(r"\\d{1,2}",line):
-                    v=int(line)
-                    if 1<=v<=30:
-                        number=v
-                        number_i=k
+            for k, line in enumerate(seg[1:16], start=1):
+                if re.fullmatch(r"\d{1,2}", line):
+                    v = int(line)
+                    if 1 <= v <= 30:
+                        number = v
+                        number_i = k
                         break
 
         if number is None:
             continue
 
-        search_from=1 if number_i==0 else number_i+1
-        name=None
-        skip_words={
-            "ブリンカー着用","取消","除外","競走除外",
-            "勝負服の画像","馬柱の見方","着順で色分け","同一レースで色分け"
+        search_from = 1 if number_i == 0 else number_i + 1
+        name = None
+        skip_words = {
+            "ブリンカー着用", "取消", "除外", "競走除外",
+            "勝負服の画像", "馬柱の見方", "着順で色分け", "同一レースで色分け",
         }
 
-        for line in seg[search_from:search_from+14]:
+        for line in seg[search_from:search_from + 16]:
             if not line or line in skip_words:
                 continue
-            if re.fullmatch(r"(牡|牝|せん)\\d+(?:/.*)?",line):
+            if re.fullmatch(r"(牡|牝|せん)\d+(?:/.*)?", line):
                 continue
-            if re.fullmatch(r"\\d{2}(?:\\.\\d)?kg",line):
+            if re.fullmatch(r"\d{2}(?:\.\d)?kg", line):
                 continue
-            if re.fullmatch(r"\\d+(?:\\.\\d+)?",line):
+            if re.fullmatch(r"\d+(?:\.\d+)?", line):
                 continue
-            if re.fullmatch(r"\\(\\d+番人気\\)",line):
+            if re.fullmatch(r"\(\d+番人気\)", line):
                 continue
-            if re.fullmatch(r"\\d{3}kg\\((?:初出走|[+-]?\\d+)\\)",line):
+            if re.fullmatch(r"\d{3}kg\((?:初出走|[+-]?\d+)\)", line):
                 continue
             if line.startswith("枠") and "馬番" in line:
                 continue
-            name=line.strip()
+            name = line.strip()
             break
 
         if name:
-            blocks.append((frame,number,name,"\\n".join(seg)))
+            blocks.append((frame, number, name, "\n".join(seg)))
 
     return blocks
 
@@ -316,42 +430,96 @@ def audit(res,inp):
 
 st.set_page_config(page_title="OADPシナリオ分離シミュレーター",layout="wide")
 st.title("OADP シナリオ分離型レースシミュレーター")
+st.caption(f"Parser version: {APP_VERSION}")
 st.caption(f"Version {APP_VERSION} / FACT・DERIVED・ESTIMATE分離 / 人気・オッズを物理計算に不使用")
 with st.sidebar:
     trials=st.slider("各シナリオ試行数",300,10000,3000,300)
     seeds=st.slider("シード数",1,30,10)
 tabs=st.tabs(["入力","基礎数値","シミュレーション"])
 with tabs[0]:
-    text=st.text_area("JRA出馬表テキストを貼り付け",height=420)
-    f=st.file_uploader("またはTXT",type=["txt"])
-    if f:
-        text=f.getvalue().decode("utf-8",errors="replace")
-    race={}; horses=[]; warns=[]
-    if text:
-        race,horses,warns=parse_text(text)
-        for w in warns: st.warning(w)
+    input_method = st.radio(
+        "入力方法",
+        ["地方競馬公式URL", "JRA出馬表テキスト"],
+        horizontal=True,
+    )
+
+    race = {}
+    horses = []
+    warns = []
+    source_note = ""
+
+    if input_method == "地方競馬公式URL":
+        race_url = st.text_input(
+            "地方競馬公式 出馬表URL",
+            placeholder="https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?...",
+        )
+        st.caption("STEP0作成アプリ v3.8 の地方競馬HTMLパーサーをそのまま利用します。")
+        load_url = st.button("URLから出馬表データを取得", type="primary")
+
+        if load_url:
+            try:
+                race_html = fetch_nar_html(race_url)
+                nar_race = parse_nar_html(race_html)
+                race, horses = nar_race_to_sim_input(nar_race)
+                if not horses:
+                    raise ValueError("公式HTMLは取得できましたが、出走馬を抽出できませんでした。出馬表公開前またはHTML構造変更の可能性があります。")
+                st.session_state["pending_race"] = race
+                st.session_state["pending_horses"] = horses
+                st.session_state["pending_source"] = race_url
+                st.success(f"地方競馬公式URLから {len(horses)}頭を取得しました。")
+            except Exception as e:
+                st.error(f"URL読込に失敗しました: {type(e).__name__}: {e}")
+
+        race = st.session_state.get("pending_race", {})
+        horses = st.session_state.get("pending_horses", [])
+        source_note = st.session_state.get("pending_source", "")
+
+    else:
+        text = st.text_area("JRA出馬表テキストを貼り付け", height=420)
+        f = st.file_uploader("またはTXT", type=["txt"])
+        if f:
+            text = f.getvalue().decode("utf-8", errors="replace")
+        if text:
+            race, horses, warns = parse_text(text)
+            source_note = "JRA_TEXT"
+
+    for w in warns:
+        st.warning(w)
+
+    if race:
+        st.subheader("レース情報")
         st.json(race)
+        if source_note:
+            st.caption(f"入力元: {source_note}")
+
+    if horses:
         st.write(f"抽出馬数: **{len(horses)}頭**")
-        if horses:
-            st.dataframe(pd.DataFrame([{k:v for k,v in h.items() if k!="runs"}|{"近走数":len(h["runs"])} for h in horses]),use_container_width=True)
-        else:
-            st.error("馬が0頭のため、基礎数値は生成できません。枠・馬番・馬名を含む出馬表全文を貼り付けてください。")
-    generate=st.button("基礎数値を生成",type="primary",disabled=(len(horses)==0))
+        st.dataframe(
+            pd.DataFrame([
+                {k: v for k, v in h.items() if k != "runs"} | {"近走数": len(h.get("runs", []))}
+                for h in horses
+            ]),
+            use_container_width=True,
+        )
+    elif race:
+        st.error("馬が0頭のため、基礎数値は生成できません。")
+
+    generate = st.button("基礎数値を生成", disabled=(len(horses) == 0))
     if generate:
         try:
-            base=derive(race,horses)
-            ok,msg=validate_base(base)
+            base = derive(race, horses)
+            ok, msg = validate_base(base)
             if not ok:
                 st.error(msg)
             else:
-                st.session_state["race"]=race
-                st.session_state["base"]=base
-                for key in ("world","inputs","result","audit"):
-                    st.session_state.pop(key,None)
+                st.session_state["race"] = race
+                st.session_state["base"] = base
+                for key in ("world", "inputs", "result", "audit"):
+                    st.session_state.pop(key, None)
                 st.success(f"{len(base)}頭の基礎数値を生成しました。")
         except Exception as e:
             st.error(f"基礎数値生成に失敗しました: {type(e).__name__}: {e}")
-            st.info("馬番・馬名の抽出結果を確認してください。")
+
 with tabs[1]:
     if "base" not in st.session_state: st.info("入力タブから生成してください。")
     else:
