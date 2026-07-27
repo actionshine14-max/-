@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+APP_VERSION="0.1.1-fixed"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -24,7 +25,8 @@ def wmean(v,w):
 
 HEADER=re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日.*?(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉).*?(\d{1,2})レース",re.S)
 DIST=re.compile(r"コース：?\s*([\d,]+)メートル（(芝|ダート)・(右|左)")
-HORSE=re.compile(r"枠(\d+)[^\n]*\n(\d+)\s*(?:\nブリンカー着用)?\n([^\n]+)")
+HORSE_STRICT=re.compile(r"枠\\s*(\\d+)[^\\n]*\\n\\s*(\\d{1,2})\\s*(?:\\n\\s*)*(?:ブリンカー着用\\s*(?:\\n\\s*)*)?([^\\n]+)")
+FRAME_MARK=re.compile(r"(?m)^\\s*(?:枠\\s*(\\d+)|(\\d+)\\s*枠)\\s*$")
 DATE=re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日")
 COURSE=re.compile(r"(\d{3,4})(芝|ダ)")
 PASS=re.compile(r"^\s*(\d{1,2})(?:\s+(\d{1,2}))?(?:\s+(\d{1,2}))?(?:\s+(\d{1,2}))?\s*$",re.M)
@@ -50,28 +52,105 @@ def parse_runs(block):
                     "positions":pos,"up3f":float(up.group(1)) if up else None})
     return out
 
+
+def _clean_lines(text):
+    return [re.sub(r"[ \\t\\u3000]+"," ",x).strip() for x in text.replace("\\r\\n","\\n").replace("\\r","\\n").split("\\n")]
+
+def _horse_blocks_flexible(text):
+    """JRAコピー形式の空行・全角空白・枠表記揺れに耐える馬ブロック抽出。"""
+    lines=_clean_lines(text)
+    starts=[]
+    for i,line in enumerate(lines):
+        m=re.fullmatch(r"(?:枠\\s*(\\d+)|(\\d+)\\s*枠)",line)
+        if m:
+            starts.append((i,int(m.group(1) or m.group(2))))
+    blocks=[]
+    for j,(idx,frame) in enumerate(starts):
+        end=starts[j+1][0] if j+1<len(starts) else len(lines)
+        seg=lines[idx:end]
+        number=None; number_i=None
+        for k,line in enumerate(seg[1:14],start=1):
+            if re.fullmatch(r"\\d{1,2}",line):
+                v=int(line)
+                if 1<=v<=30:
+                    number=v; number_i=k; break
+        if number is None:
+            continue
+        name=None
+        skip_words=("ブリンカー着用","取消","除外","競走除外")
+        for line in seg[number_i+1:number_i+10]:
+            if not line or line in skip_words:
+                continue
+            if re.fullmatch(r"(牡|牝|せん)\\d+",line): continue
+            if re.fullmatch(r"\\d{2}(?:\\.\\d)?kg",line): continue
+            if re.fullmatch(r"\\d+(?:\\.\\d+)?",line): continue
+            if re.fullmatch(r"\\(\\d+番人気\\)",line): continue
+            name=line
+            break
+        if name:
+            blocks.append((frame,number,name,"\\n".join(seg)))
+    return blocks
+
+def _horse_blocks(text):
+    flexible=_horse_blocks_flexible(text)
+    if flexible:
+        return flexible
+    ms=list(HORSE_STRICT.finditer(text))
+    out=[]
+    for i,m in enumerate(ms):
+        b=text[m.start():(ms[i+1].start() if i+1<len(ms) else len(text))]
+        out.append((int(m.group(1)),int(m.group(2)),m.group(3).strip(),b))
+    return out
+
 def parse_text(text):
     race={}; warns=[]
     h=HEADER.search(text)
-    if h: race={"date":f"{h.group(1)}-{int(h.group(2)):02d}-{int(h.group(3)):02d}","track":h.group(4),"race_no":int(h.group(5))}
-    else: warns.append("開催情報を抽出できませんでした。")
+    if h:
+        race={"date":f"{h.group(1)}-{int(h.group(2)):02d}-{int(h.group(3)):02d}","track":h.group(4),"race_no":int(h.group(5))}
+    else:
+        warns.append("開催情報を抽出できませんでした。")
     d=DIST.search(text)
-    if d: race|={"distance":int(d.group(1).replace(",","")),"surface":"dirt" if d.group(2)=="ダート" else "turf","direction":d.group(3)}
-    else: warns.append("距離・芝ダートを抽出できませんでした。")
-    ms=list(HORSE.finditer(text)); horses=[]
-    for i,m in enumerate(ms):
-        b=text[m.start():(ms[i+1].start() if i+1<len(ms) else len(text))]
+    if d:
+        race|={"distance":int(d.group(1).replace(",","")),"surface":"dirt" if d.group(2)=="ダート" else "turf","direction":d.group(3)}
+    else:
+        warns.append("距離・芝ダートを抽出できませんでした。")
+
+    horses=[]
+    seen=set()
+    for frame,number,name,b in _horse_blocks(text):
+        if number in seen:
+            continue
+        seen.add(number)
         bw=BW.search(b); od=ODDS.search(b); loads=list(LOAD.finditer(b))
-        horses.append({"frame":int(m.group(1)),"number":int(m.group(2)),"name":m.group(3).strip(),
-                       "load":float(loads[0].group(1)) if loads else 57.0,
-                       "body_weight":int(bw.group(1)) if bw else None,
-                       "body_weight_delta":None if not bw or bw.group(2)=="初出走" else int(bw.group(2)),
-                       "debut":bool(bw and bw.group(2)=="初出走"),"blinker":"ブリンカー着用" in b,
-                       "odds":float(od.group(1)) if od else None,"popularity":int(od.group(2)) if od else None,
-                       "runs":parse_runs(b)})
+        horses.append({
+            "frame":frame,"number":number,"name":name,
+            "load":float(loads[0].group(1)) if loads else 57.0,
+            "body_weight":int(bw.group(1)) if bw else None,
+            "body_weight_delta":None if not bw or bw.group(2)=="初出走" else int(bw.group(2)),
+            "debut":bool(bw and bw.group(2)=="初出走"),
+            "blinker":"ブリンカー着用" in b,
+            "odds":float(od.group(1)) if od else None,
+            "popularity":int(od.group(2)) if od else None,
+            "runs":parse_runs(b)
+        })
+    horses=sorted(horses,key=lambda x:x["number"])
     race["field_size"]=len(horses)
-    if not horses: warns.append("馬ブロックを抽出できませんでした。")
+    if not horses:
+        warns.append("馬ブロックを抽出できませんでした。入力形式を確認してください。基礎数値生成は実行されません。")
     return race,horses,warns
+
+def validate_base(df):
+    required={"馬番","馬名","初速","巡航","再加速","直線余力","入力信頼度",
+              "逃げ番手率","出遅れ推定率","内包まれ率","外回し率","進路詰まり率",
+              "ラスト失速率","内枠優位","外枠負荷","斤量"}
+    if df is None or not isinstance(df,pd.DataFrame) or df.empty:
+        return False,"基礎データが空です。"
+    missing=sorted(required-set(df.columns))
+    if missing:
+        return False,"必要列が不足しています: "+", ".join(missing)
+    if df["馬番"].isna().any() or df["馬名"].isna().any():
+        return False,"馬番または馬名に欠損があります。"
+    return True,""
 
 def derive(race,horses):
     n=max(1,len(horses)); td=float(race.get("distance",1800)); surf=race.get("surface","dirt")
@@ -189,7 +268,7 @@ def audit(res,inp):
 
 st.set_page_config(page_title="OADPシナリオ分離シミュレーター",layout="wide")
 st.title("OADP シナリオ分離型レースシミュレーター")
-st.caption("試作版 / FACT・DERIVED・ESTIMATE分離 / 人気・オッズを物理計算に不使用")
+st.caption(f"Version {APP_VERSION} / FACT・DERIVED・ESTIMATE分離 / 人気・オッズを物理計算に不使用")
 with st.sidebar:
     trials=st.slider("各シナリオ試行数",300,10000,3000,300)
     seeds=st.slider("シード数",1,30,10)
@@ -197,14 +276,34 @@ tabs=st.tabs(["入力","基礎数値","シミュレーション"])
 with tabs[0]:
     text=st.text_area("JRA出馬表テキストを貼り付け",height=420)
     f=st.file_uploader("またはTXT",type=["txt"])
-    if f: text=f.getvalue().decode("utf-8",errors="replace")
+    if f:
+        text=f.getvalue().decode("utf-8",errors="replace")
+    race={}; horses=[]; warns=[]
     if text:
-      race,horses,warns=parse_text(text)
-      for w in warns: st.warning(w)
-      st.json(race)
-      if horses: st.dataframe(pd.DataFrame([{k:v for k,v in h.items() if k!="runs"}|{"近走数":len(h["runs"])} for h in horses]),use_container_width=True)
-      if st.button("基礎数値を生成",type="primary"):
-        st.session_state["race"]=race; st.session_state["base"]=derive(race,horses); st.success("生成しました")
+        race,horses,warns=parse_text(text)
+        for w in warns: st.warning(w)
+        st.json(race)
+        st.write(f"抽出馬数: **{len(horses)}頭**")
+        if horses:
+            st.dataframe(pd.DataFrame([{k:v for k,v in h.items() if k!="runs"}|{"近走数":len(h["runs"])} for h in horses]),use_container_width=True)
+        else:
+            st.error("馬が0頭のため、基礎数値は生成できません。枠・馬番・馬名を含む出馬表全文を貼り付けてください。")
+    generate=st.button("基礎数値を生成",type="primary",disabled=(len(horses)==0))
+    if generate:
+        try:
+            base=derive(race,horses)
+            ok,msg=validate_base(base)
+            if not ok:
+                st.error(msg)
+            else:
+                st.session_state["race"]=race
+                st.session_state["base"]=base
+                for key in ("world","inputs","result","audit"):
+                    st.session_state.pop(key,None)
+                st.success(f"{len(base)}頭の基礎数値を生成しました。")
+        except Exception as e:
+            st.error(f"基礎数値生成に失敗しました: {type(e).__name__}: {e}")
+            st.info("馬番・馬名の抽出結果を確認してください。")
 with tabs[1]:
     if "base" not in st.session_state: st.info("入力タブから生成してください。")
     else:
@@ -213,9 +312,15 @@ with tabs[1]:
 with tabs[2]:
     if "base" not in st.session_state: st.info("基礎数値がありません。")
     else:
-      if st.button("S1/S2/S3生成・実行",type="primary"):
-        b,w=worlds(st.session_state["base"]); i=scenario_inputs(b,w); r=simulate(i,trials,seeds); a=audit(r,i)
-        st.session_state.update(world=w,inputs=i,result=r,audit=a)
+      ok,msg=validate_base(st.session_state["base"])
+      if not ok:
+        st.error(msg)
+      if st.button("S1/S2/S3生成・実行",type="primary",disabled=not ok):
+        try:
+          b,w=worlds(st.session_state["base"]); i=scenario_inputs(b,w); r=simulate(i,trials,seeds); a=audit(r,i)
+          st.session_state.update(world=w,inputs=i,result=r,audit=a)
+        except Exception as e:
+          st.error(f"シミュレーション実行に失敗しました: {type(e).__name__}: {e}")
       if "world" in st.session_state:
         st.subheader("シナリオ世界"); st.dataframe(st.session_state["world"],use_container_width=True)
         st.subheader("全頭×S1/S2/S3入力"); st.dataframe(st.session_state["inputs"],use_container_width=True)
