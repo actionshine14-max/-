@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from oadp_engine import parse_nar_html
 
-APP_VERSION="0.2.0-step0-parser-integrated"
+APP_VERSION="0.4.0-event-driven"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -314,172 +314,346 @@ def validate_base(df):
         return False,"馬番または馬名に欠損があります。"
     return True,""
 
+
 def derive(race,horses):
+    """出馬表・近走事実から局所能力を分離して生成する。人気・オッズは不使用。"""
     n=max(1,len(horses)); td=float(race.get("distance",1800)); surf=race.get("surface","dirt")
     rows=[]
     for h in horses:
-        first=[]; last=[]; ws=[]; ups=[]; fins=[]; front=[]
+        first=[]; last=[]; ws=[]; ups=[]; fins=[]; front=[]; moves=[]; pos_var=[]
         for i,r in enumerate(h.get("runs",[])[:5]):
-            fs=int(r.get("field_size") or n); sim=max(.35,1-abs((r.get("distance") or td)-td)/1000)
+            fs=int(r.get("field_size") or n)
+            sim=max(.35,1-abs((r.get("distance") or td)-td)/1000)
             if r.get("surface") and r.get("surface")!=surf: sim*=.45
             w=sim*math.exp(-.22*i)
             if r.get("positions"):
-                first.append(nrank(r["positions"][0],fs)); last.append(nrank(r["positions"][-1],fs)); ws.append(w)
+                a=nrank(r["positions"][0],fs); b=nrank(r["positions"][-1],fs)
+                first.append(a); last.append(b); ws.append(w)
+                moves.append(b-a)
+                pos_var.append(float(np.std(r["positions"],ddof=0)) if len(r["positions"])>1 else 0.0)
                 front.append(1 if r["positions"][0]<=max(3,math.ceil(fs*.25)) else 0)
             if r.get("up3f") is not None: ups.append(float(r["up3f"]))
             if r.get("finish") is not None: fins.append(nrank(r["finish"],fs))
         conf=clamp(10*(.55*min(len(h.get("runs",[])),5)/5+.45*min(len(ups),5)/5))
-        ep=wmean(first,ws) if first else 5.0; cp=wmean(last,ws) if last else ep
+        ep=wmean(first,ws) if first else 5.0
+        cp=wmean(last,ws) if last else ep
         close=clamp(10-(np.mean(ups)-34)*.95) if ups else 5.0
         fq=float(np.mean(fins)) if fins else 5.0
         inner=clamp(10*(1-(h["number"]-1)/max(1,n-1))); outer=10-inner
         load=float(h.get("load") or 57); relief=clamp(5+(57-load)*.9)
         delta=float(h.get("body_weight_delta") or 0); stable=clamp(10-abs(delta)*.22)
-        cruise=.5*cp+.25*fq+.25*stable; reacc=.45*cp+.35*close+.2*relief; straight=.55*close+.25*fq+.2*relief
+        move_ev=clamp(5+(np.average(moves,weights=ws[:len(moves)]) if moves else 0))
+        pos_stability=clamp(10-(np.mean(pos_var)*1.15 if pos_var else 3.0))
+        front_rate=float(np.mean(front)) if front else .25
+        cruise=clamp(.42*cp+.25*fq+.20*stable+.13*pos_stability)
+        reacc=clamp(.34*move_ev+.28*cp+.23*close+.15*relief)
+        straight=clamp(.55*close+.25*fq+.20*relief)
         if h.get("debut"): conf=min(conf,2)
         miss=clamp((10-ep)*.055+(1-conf/10)*.18,.03,.70)
-        trap=clamp((inner/10)*(.12+max(0,5-ep)*.025),.02,.48); wide=clamp((outer/10)*.42,.02,.52)
+        trap=clamp((inner/10)*(.12+max(0,5-ep)*.025),.02,.48)
+        wide=clamp((outer/10)*.42,.02,.52)
         block=clamp(.10+(1-conf/10)*.15+trap*.30,.04,.55)
         fatigue=clamp(4.8+max(0,td-1600)/500+(10-cruise)*.23-(relief-5)*.18)
         loss=clamp(logistic((fatigue-straight)*.45),.05,.85)
-        rows.append({"馬番":h["number"],"馬名":h["name"],"枠":h["frame"],"斤量":load,"馬体重":h.get("body_weight"),
-                     "増減":h.get("body_weight_delta"),"初出走":h.get("debut",False),"有効近走数":len(h.get("runs",[])),
-                     "入力信頼度":round(conf,3),"初速":round(ep,3),"巡航":round(clamp(cruise),3),
-                     "再加速":round(clamp(reacc),3),"直線余力":round(clamp(straight),3),"内枠優位":round(inner,3),
-                     "外枠負荷":round(outer,3),"逃げ番手率":round(float(np.mean(front)) if front else .25,4),
-                     "出遅れ推定率":round(miss,4),"内包まれ率":round(trap,4),"外回し率":round(wide,4),
-                     "進路詰まり率":round(block,4),"疲労EV":round(fatigue,3),"ラスト失速率":round(loss,4),
-                     "value_type":"DERIVED/ESTIMATE"})
+
+        # 能力は単一総合点にせず、区間別容量として保持する。
+        start_cap=clamp(.62*ep+.20*front_rate*10+.18*pos_stability)
+        cruise_cap=clamp(.58*cruise+.22*pos_stability+.20*stable)
+        position_cap=clamp(.48*cp+.30*pos_stability+.22*ep)
+        pressure_cap=clamp(.42*cruise+.28*reacc+.18*pos_stability+.12*(10-outer))
+        corner_cap=clamp(.52*reacc+.28*move_ev+.20*cp)
+        recovery_cap=clamp(.46*cruise+.30*straight+.24*stable)
+        straight_cap=straight
+        vmax_cap=clamp(.62*close+.23*reacc+.15*fq)
+
+        rows.append({
+            "馬番":h["number"],"馬名":h["name"],"枠":h["frame"],"斤量":load,
+            "馬体重":h.get("body_weight"),"増減":h.get("body_weight_delta"),
+            "初出走":h.get("debut",False),"有効近走数":len(h.get("runs",[])),
+            "入力信頼度":round(conf,3),"初速":round(ep,3),"巡航":round(cruise,3),
+            "再加速":round(reacc,3),"直線余力":round(straight,3),
+            "内枠優位":round(inner,3),"外枠負荷":round(outer,3),
+            "逃げ番手率":round(front_rate,4),"出遅れ推定率":round(miss,4),
+            "内包まれ率":round(trap,4),"外回し率":round(wide,4),
+            "進路詰まり率":round(block,4),"疲労EV":round(fatigue,3),
+            "ラスト失速率":round(loss,4),
+            "START_CAPACITY":round(start_cap,3),
+            "CRUISE_CAPACITY":round(cruise_cap,3),
+            "POSITION_CAPACITY":round(position_cap,3),
+            "PRESSURE_CAPACITY":round(pressure_cap,3),
+            "CORNER_CAPACITY":round(corner_cap,3),
+            "RECOVERY_CAPACITY":round(recovery_cap,3),
+            "STRAIGHT_CAPACITY":round(straight_cap,3),
+            "VMAX_CAPACITY":round(vmax_cap,3),
+            "位置上昇EV":round(move_ev,3),"位置安定EV":round(pos_stability,3),
+            "value_type":"DERIVED/ESTIMATE"
+        })
     return pd.DataFrame(rows).sort_values("馬番").reset_index(drop=True)
 
 def worlds(base):
-    """
-    OADP Ver.2.35: 馬評価より先に馬群構成からS1/S2/S3を作る。
-    人気・オッズは使用しない。
-    """
+    """馬群構成だけから分岐世界を作る。人気・オッズ・総合能力は使わない。"""
     d=base.copy(); n=len(d)
-    raw=np.exp(.42*d["初速"]/10+.22*d["逃げ番手率"]+.16*d["内枠優位"]/10-.12*d["出遅れ推定率"]-.08*d["外枠負荷"]/10)
-    d["ハナ取得確率基礎"]=raw/raw.sum()
+    claim_raw=np.exp(
+        .48*d["START_CAPACITY"]/10+
+        .25*d["逃げ番手率"]+
+        .17*d["内枠優位"]/10-
+        .10*d["出遅れ推定率"]
+    )
+    d["ハナ取得確率基礎"]=claim_raw/claim_raw.sum()
+    d["先行参加確率基礎"]=np.clip(
+        .18+.55*d["逃げ番手率"]+.20*d["START_CAPACITY"]/10-.15*d["出遅れ推定率"],.05,.95
+    )
+    front_count=int((d["先行参加確率基礎"]>=.48).sum())
+    strong_claim=int((d["ハナ取得確率基礎"]>=max(.12,1/max(1,n)*1.6)).sum())
+    weak_front=int(((d["先行参加確率基礎"]>=.42)&(d["PRESSURE_CAPACITY"]<=5.4)).sum())
+    closer_count=int((d["STRAIGHT_CAPACITY"]>=d["START_CAPACITY"]+.5).sum())
+    uncertainty=clamp(10-d["入力信頼度"].mean()+d["START_CAPACITY"].std(ddof=0))
+    pressure=clamp(1.3+front_count*.95+strong_claim*.85+weak_front*.55+d["先行参加確率基礎"].sum()*.22)
+    control=clamp(d.nlargest(min(2,n),"ハナ取得確率基礎")["ハナ取得確率基礎"].sum()*10)
+    k6d=clamp(2.0+max(0,strong_claim-1)*1.2+uncertainty*.38)
+    k6e=clamp(1.5+d["斤量"].le(55).sum()*.55+d["内枠優位"].ge(7).sum()*.42)
+    k6f=clamp(1.2+closer_count*.62+(d["位置上昇EV"]>=6).sum()*.55)
 
-    front_count=int((d["逃げ番手率"]>=.40).sum())
-    early_count=int((d["初速"]>=d["初速"].quantile(.65)).sum())
-    closer_count=int((d["直線余力"]>=d["初速"]+.6).sum())
-    uncertainty=clamp(10-d["入力信頼度"].mean()+d["初速"].std(ddof=0))
-    pressure=clamp(1.0+front_count*1.15+early_count*.75+d["逃げ番手率"].sum()*.45)
-    support=clamp(d.nlargest(min(3,n),"初速")["初速"].mean())
-    k6_density=clamp((d["斤量"].le(55).sum()*1.2)+(d["内枠優位"].ge(7).sum()*.7)+closer_count*.8+uncertainty*.35)
-    reversal=clamp(d["初速"].rank(ascending=False).corr(d["直線余力"].rank(ascending=False))*-3+5 if n>=3 else 5)
-
-    s1_raw=max(.1, 8.5+.85*support-.72*pressure-.35*uncertainty)
-    s2_raw=max(.1, 5.0+.95*pressure+.55*closer_count+.30*reversal)
-    s3_raw=max(.1, 3.5+.80*k6_density+.55*uncertainty+.45*reversal-.30*support)
-    rr=np.array([s1_raw,s2_raw,s3_raw],dtype=float)
-    probs=rr/rr.sum()
-
-    # 物理的に成立する世界線の下限監査
-    floor=np.array([.15,.15,.15])
-    probs=np.maximum(probs,floor)
-    probs=probs/probs.sum()
-
-    upset_front=clamp(logistic(-1.1+.18*front_count+.12*(10-pressure)+.10*d["斤量"].le(55).sum()),.05,.85)
+    raw=np.array([
+        max(.1,8.0+.75*control-.63*pressure-.28*uncertainty),
+        max(.1,4.8+.86*pressure+.38*weak_front+.42*closer_count),
+        max(.1,3.8+.52*k6d+.48*k6e+.50*k6f+.34*uncertainty),
+    ])
+    probs=raw/raw.sum(); probs=np.maximum(probs,.12); probs=probs/probs.sum()
+    s3parts=np.array([pressure+weak_front, k6d+k6e, k6f+closer_count],float)
+    s3parts=s3parts/s3parts.sum()
 
     w=pd.DataFrame([
-      ["S1","自然隊列・主導馬残存",clamp(pressure-1.8),clamp(.10+.018*closer_count+.010*pressure,0,1),.78,.78,.78,probs[0]],
-      ["S2","前圧継続・好位中団接続",clamp(pressure+1.5),clamp(.30+.045*closer_count+.022*pressure,0,1),1.12,1.28,1.08,probs[1]],
-      ["S3","反相関・構造穴（K6複合）",clamp(pressure+.4),clamp(.36+.050*closer_count+.025*uncertainty,0,1),1.65,1.18,1.48,probs[2]]],
-      columns=["シナリオ","説明","前列圧","差し接続率","位置分散倍率","前列失速倍率","進路摩擦倍率","発生確率"])
-    w["荒れ前残り発生率"]=upset_front
-    w["構造荒れ指数"]=clamp(4.8+.35*uncertainty+.30*k6_density+.20*reversal)
+        ["S1","自然隊列・主逃げ成立",probs[0],"S1",.78,.25,.25,.20],
+        ["S2","前列圧継続・複数回負荷",probs[1],"S2",1.35,.70,.65,.45],
+        ["S3","構造穴分岐",probs[2],"S3",1.05,s3parts[0],s3parts[1],s3parts[2]],
+    ],columns=["シナリオ","説明","発生確率","分岐型","圧力倍率","S3-Fa比率","S3-Fb比率","S3-L比率"])
+    w["前列圧指数"]=pressure
+    w["K6D指数"]=k6d; w["K6E指数"]=k6e; w["K6F指数"]=k6f
     return d,w
 
 def scenario_inputs(base,w):
-    """
-    S1/S2/S3で同じ能力式を流用せず、世界線ごとの4角到達構造を分離する。
-    """
+    """イベントエンジンへ渡す局所能力と条件付き確率を作る。"""
     out=[]
     for _,z in w.iterrows():
-      sid=z["シナリオ"]
-      for _,h in base.iterrows():
-        early=h["初速"]; cruise=h["巡航"]; reacc=h["再加速"]; straight=h["直線余力"]
-        conf=h["入力信頼度"]; inner=h["内枠優位"]; outer=h["外枠負荷"]
-        front=h["逃げ番手率"]; light=clamp(5+(57-h["斤量"])*1.25)
-        closer=clamp(straight-early+5)
-        repro=clamp(10-h["出遅れ推定率"]*10-h["進路詰まり率"]*3)
-        pressure_tol=clamp(.40*cruise+.30*reacc+.20*repro+.10*(10-outer))
-        structural_f=clamp(.28*light+.22*inner+.20*early+.15*repro+.15*(10-front*5))
-        structural_l=clamp(.30*straight+.24*reacc+.20*light+.14*(10-early)+.12*(10-inner))
-        recv=clamp(z["前列圧"]*(.38+.70*front)+outer*.13+h["内包まれ率"]*2.2)
+        sid=z["シナリオ"]
+        for _,h in base.iterrows():
+            conf=h["入力信頼度"]/10
+            light=clamp(5+(57-h["斤量"])*1.2)
+            claim=clamp(.48*h["START_CAPACITY"]+.25*h["逃げ番手率"]*10+.17*h["内枠優位"]+.10*light)
+            resist=clamp(.40*h["PRESSURE_CAPACITY"]+.30*h["POSITION_CAPACITY"]+.20*h["CORNER_CAPACITY"]+.10*conf*10)
+            move=clamp(.48*h["CORNER_CAPACITY"]+.28*h["位置上昇EV"]+.24*h["CRUISE_CAPACITY"])
+            close_conn=clamp(.45*h["CORNER_CAPACITY"]+.35*h["STRAIGHT_CAPACITY"]+.20*h["VMAX_CAPACITY"])
+            uncertainty=clamp(1-conf,.05,.85,)
 
-        if sid=="S1":
-          early_ev=clamp(.34*early+.22*repro+.18*inner+.16*cruise+.10*pressure_tol)
-          dc=clamp(z["差し接続率"]*(.55+.55*closer/10),0,1)
-          reserve=clamp(.44*straight+.24*cruise+.16*reacc+.10*light+.06*repro-.16*recv)
-          role=clamp(.45*early+.30*repro+.25*inner)
-        elif sid=="S2":
-          early_ev=clamp(.20*early+.25*pressure_tol+.20*cruise+.18*reacc+.17*closer-.22*recv)
-          dc=clamp(z["差し接続率"]*(.72+1.10*closer/10),0,1)
-          reserve=clamp(.34*straight+.25*reacc+.20*pressure_tol+.11*light+.10*cruise-.22*recv)
-          role=clamp(.40*pressure_tol+.30*reacc+.30*straight)
-        else:
-          # S3は能力順の並べ替えではなく、軽斤量・内枠・差し接続・反相関複合
-          early_ev=clamp(max(structural_f,structural_l)-.12*recv-.22*front*early)
-          dc=clamp(z["差し接続率"]*(.82+1.25*closer/10),0,1)
-          reserve=clamp(max(.30*straight+.25*reacc+.20*light+.15*(10-early)+.10*inner,
-                            .28*straight+.20*cruise+.22*light+.18*inner+.12*repro)-.10*recv)
-          role=clamp(.34*light+.24*straight+.20*inner+.22*(10-front*10))
-
-        fail=comb(h["出遅れ推定率"],h["内包まれ率"]*z["進路摩擦倍率"],h["外回し率"]*.45,min(.75,recv/18))
-        loss=clamp(h["ラスト失速率"]*z["前列失速倍率"]*(.78+.52*front),.03,.94)
-        route=clamp(1-comb(h["進路詰まり率"]*z["進路摩擦倍率"],h["外回し率"]*.45,h["内包まれ率"]*.38),.05,.98)
-        remain=clamp(reserve+.18*role-.22*loss*10)
-
-        out.append({
-          "馬番":h["馬番"],"馬名":h["馬名"],"シナリオ":sid,
-          "シナリオ発生確率":z["発生確率"],"ハナ取得確率":h["ハナ取得確率基礎"],
-          "先手参加率":clamp(.28*h["ハナ取得確率基礎"]+.72*logistic((early_ev-5.0)/1.05),0,1),
-          "前列圧被害EV":recv,"序盤位置不発率":fail,"差し接続確率":dc,
-          "残存エネルギーEV":remain,"進路実現確率":route,"ラスト失速率":loss,
-          "位置分散倍率":z["位置分散倍率"],"初速":early_ev,"巡航":cruise,
-          "再加速":reacc,"直線余力":straight,"入力信頼度":conf,
-          "OADPシナリオ専用EV":role,"構造穴EV":max(structural_f,structural_l) if sid=="S3" else 0
-        })
+            out.append({
+                "馬番":h["馬番"],"馬名":h["馬名"],"シナリオ":sid,
+                "シナリオ発生確率":z["発生確率"],
+                "ハナ取得確率":h["ハナ取得確率基礎"],
+                "先行参加率":h["先行参加確率基礎"],
+                "主張EV":claim,"抵抗EV":resist,"3角進出EV":move,"差し接続EV":close_conn,
+                "START_CAPACITY":h["START_CAPACITY"],"CRUISE_CAPACITY":h["CRUISE_CAPACITY"],
+                "POSITION_CAPACITY":h["POSITION_CAPACITY"],"PRESSURE_CAPACITY":h["PRESSURE_CAPACITY"],
+                "CORNER_CAPACITY":h["CORNER_CAPACITY"],"RECOVERY_CAPACITY":h["RECOVERY_CAPACITY"],
+                "STRAIGHT_CAPACITY":h["STRAIGHT_CAPACITY"],"VMAX_CAPACITY":h["VMAX_CAPACITY"],
+                "出遅れ推定率":h["出遅れ推定率"],"内包まれ率":h["内包まれ率"],
+                "外回し率":h["外回し率"],"進路詰まり率":h["進路詰まり率"],
+                "ラスト失速率":h["ラスト失速率"],"内枠優位":h["内枠優位"],
+                "外枠負荷":h["外枠負荷"],"斤量":h["斤量"],"入力信頼度":h["入力信頼度"],
+                "圧力倍率":z["圧力倍率"],"S3-Fa比率":z["S3-Fa比率"],
+                "S3-Fb比率":z["S3-Fb比率"],"S3-L比率":z["S3-L比率"],
+                "value_type":"DERIVED/SCENARIO_ESTIMATE"
+            })
     return pd.DataFrame(out)
 
-def simulate(inp,trials,seeds):
-    rec=[]
-    for sid in SCENARIOS:
-      d=inp[inp["シナリオ"]==sid].reset_index(drop=True); n=len(d); rows=[]; per=max(50,trials//seeds)
-      for seed in range(seeds):
-        rng=np.random.default_rng(20260726+seed*1009+SCENARIOS.index(sid))
-        for _ in range(per):
-          sig=d["位置分散倍率"].to_numpy()*(.45+(1-d["入力信頼度"].to_numpy()/10)*.85)
-          start=d["初速"].to_numpy()+rng.normal(0,sig)-rng.binomial(1,d["序盤位置不発率"].to_numpy())*rng.uniform(.7,2.2,n)
-          mid=.46*start+.34*d["巡航"].to_numpy()+.20*d["再加速"].to_numpy()-.26*d["前列圧被害EV"].to_numpy()
-          conn=rng.binomial(1,d["差し接続確率"].to_numpy())
-          cs=mid+conn*d["再加速"].to_numpy()*.22+rng.normal(0,sig*.55)
-          order=np.argsort(-cs); cr=np.empty(n,int); cr[order]=np.arange(1,n+1)
-          blocked=rng.binomial(1,1-d["進路実現確率"].to_numpy()); faded=rng.binomial(1,d["ラスト失速率"].to_numpy())
-          fs=.34*cs+.42*d["残存エネルギーEV"].to_numpy()+.24*d["直線余力"].to_numpy()-blocked*rng.uniform(.5,1.8,n)-faded*rng.uniform(.7,2.5,n)+rng.normal(0,sig*.45)
-          order=np.argsort(-fs); fr=np.empty(n,int); fr[order]=np.arange(1,n+1)
-          for i in range(n): rows.append([d.loc[i,"馬番"],d.loc[i,"馬名"],cr[i],fr[i],blocked[i],faded[i]])
-      r=pd.DataFrame(rows,columns=["馬番","馬名","4角順位","着順","進路不発","失速"])
-      for (num,name),g in r.groupby(["馬番","馬名"],sort=False):
-        rec.append({"シナリオ":sid,"馬番":num,"馬名":name,"4角順位平均":g["4角順位"].mean(),"4角順位SD":g["4角順位"].std(ddof=0),
-                    "4角3位内率":(g["4角順位"]<=3).mean(),"勝率":(g["着順"]==1).mean(),"複勝率":(g["着順"]<=3).mean(),
-                    "平均着順":g["着順"].mean(),"実測進路不発率":g["進路不発"].mean(),"実測失速率":g["失速"].mean()})
-    return pd.DataFrame(rec)
+SEGMENTS=("START","EARLY_POSITION","FIRST_CORNER","MID_CRUISE","THIRD_CORNER","FOURTH_CORNER_EXIT")
 
-def audit(res,inp):
+def _choose_s3_branch(row,rng):
+    p=np.array([row["S3-Fa比率"],row["S3-Fb比率"],row["S3-L比率"]],float)
+    p=p/p.sum()
+    return rng.choice(["S3-Fa","S3-Fb","S3-L"],p=p)
+
+def simulate(inp,trials,seeds):
+    """条件付きイベント型Monte Carlo。各試行で発馬・主張・抵抗・圧力・息入れ・3角進出を発生させる。"""
+    summaries=[]; event_rows=[]; branch_rows=[]
+    for sid in SCENARIOS:
+        d=inp[inp["シナリオ"]==sid].reset_index(drop=True)
+        n=len(d); per=max(20,trials//max(1,seeds)); total=per*seeds
+        horse_acc={int(r["馬番"]):{"corner":[],"finish":[],"energy":[],"pressure":[],"moves":[],"blocked":[],"faded":[],"lead":0} for _,r in d.iterrows()}
+        event_counts={}
+        branch_counts={}
+        for seed in range(seeds):
+            rng=np.random.default_rng(20260726+seed*1009+SCENARIOS.index(sid)*100003)
+            for _ in range(per):
+                branch=sid if sid!="S3" else _choose_s3_branch(d.iloc[0],rng)
+                branch_counts[branch]=branch_counts.get(branch,0)+1
+                start_cap=d["START_CAPACITY"].to_numpy(float)
+                cruise_cap=d["CRUISE_CAPACITY"].to_numpy(float)
+                pos_cap=d["POSITION_CAPACITY"].to_numpy(float)
+                press_cap=d["PRESSURE_CAPACITY"].to_numpy(float)
+                corner_cap=d["CORNER_CAPACITY"].to_numpy(float)
+                recovery_cap=d["RECOVERY_CAPACITY"].to_numpy(float)
+                straight_cap=d["STRAIGHT_CAPACITY"].to_numpy(float)
+                vmax_cap=d["VMAX_CAPACITY"].to_numpy(float)
+                conf=d["入力信頼度"].to_numpy(float)/10
+                noise=.28+(1-conf)*.65
+
+                energy=np.ones(n)*100.0
+                pressure=np.zeros(n)
+                move_count=np.zeros(n,int)
+
+                # START
+                miss=rng.random(n)<d["出遅れ推定率"].to_numpy(float)
+                start_perf=start_cap+rng.normal(0,noise)-miss*rng.uniform(.8,2.1,n)
+                participants=rng.random(n)<d["先行参加率"].to_numpy(float)
+                if branch=="S3-Fb":
+                    # 競るはずの一部が控える
+                    front_idx=np.where(participants)[0]
+                    if len(front_idx)>1:
+                        drop=rng.choice(front_idx,size=max(1,len(front_idx)//2),replace=False)
+                        participants[drop]=False
+                if not participants.any():
+                    participants[np.argmax(start_perf)]=True
+                claim_score=np.where(participants,start_perf+.35*d["主張EV"].to_numpy(float),-999)
+                leader=int(np.argmax(claim_score))
+                order=np.argsort(-start_perf)
+                rank=np.empty(n,int); rank[order]=np.arange(1,n+1)
+                energy-=2.0+np.maximum(0,7-start_cap)*.20
+                energy[participants]-=rng.uniform(.5,1.4,participants.sum())
+                event_counts[("START","MISS")]=event_counts.get(("START","MISS"),0)+int(miss.sum())
+                event_counts[("START","CLAIM")]=event_counts.get(("START","CLAIM"),0)+int(participants.sum())
+
+                # EARLY_POSITION: pairwise pressure and reaction
+                contenders=[i for i in np.where(participants)[0] if i!=leader]
+                if sid=="S1":
+                    attack_p=.18
+                elif sid=="S2":
+                    attack_p=.72
+                elif branch=="S3-Fa":
+                    attack_p=.78
+                elif branch=="S3-Fb":
+                    attack_p=.10
+                else:
+                    attack_p=.45
+                for i in contenders:
+                    if rng.random()<attack_p:
+                        resist_p=logistic((d.iloc[leader]["抵抗EV"]-5)/1.1)
+                        resisted=rng.random()<resist_p
+                        intensity=rng.uniform(.6,1.4)*float(d.iloc[i]["圧力倍率"])
+                        pressure[leader]+=intensity
+                        pressure[i]+=intensity*.72
+                        energy[leader]-=(1.0+max(0,intensity-press_cap[leader]/7)**2)
+                        energy[i]-=(.8+max(0,intensity-press_cap[i]/7)**2)
+                        event_counts[("EARLY_POSITION","OUTSIDE_PRESS")]=event_counts.get(("EARLY_POSITION","OUTSIDE_PRESS"),0)+1
+                        if not resisted and claim_score[i]>claim_score[leader]-.4:
+                            leader=i
+                            event_counts[("EARLY_POSITION","LEAD_CHANGE")]=event_counts.get(("EARLY_POSITION","LEAD_CHANGE"),0)+1
+
+                # FIRST_CORNER: lane loss / trap
+                trapped=rng.random(n)<d["内包まれ率"].to_numpy(float)*(1.0 if branch!="S3-L" else .75)
+                wide=rng.random(n)<d["外回し率"].to_numpy(float)
+                rank=rank+trapped.astype(int)-wide.astype(int)*0
+                energy-=wide*rng.uniform(.4,1.1,n)
+                event_counts[("FIRST_CORNER","TRAPPED")]=event_counts.get(("FIRST_CORNER","TRAPPED"),0)+int(trapped.sum())
+                event_counts[("FIRST_CORNER","WIDE")]=event_counts.get(("FIRST_CORNER","WIDE"),0)+int(wide.sum())
+
+                # MID_CRUISE: pace load and recovery
+                front_zone=rank<=max(3,math.ceil(n*.30))
+                pace_load=(1.1 if sid=="S1" else 1.7 if sid=="S2" else 1.5 if branch=="S3-Fa" else .9 if branch=="S3-Fb" else 1.65)
+                demand=pace_load+front_zone*.7+pressure*.28
+                overload=np.maximum(0,demand-cruise_cap/5.2)
+                energy-=1.4+demand*.55+overload**2
+                recover=(~front_zone)*recovery_cap/10*rng.uniform(.5,1.2,n)
+                if branch=="S3-Fb": recover+=front_zone*recovery_cap/10*.55
+                energy+=recover
+                event_counts[("MID_CRUISE","RECOVERY")]=event_counts.get(("MID_CRUISE","RECOVERY"),0)+int((recover>.5).sum())
+
+                # THIRD_CORNER: conditional moves
+                if branch=="S3-Fb":
+                    move_p=.12+.22*d["3角進出EV"].to_numpy(float)/10
+                elif branch=="S3-L":
+                    move_p=.30+.55*d["差し接続EV"].to_numpy(float)/10
+                else:
+                    move_p=.20+.42*d["3角進出EV"].to_numpy(float)/10
+                move_p=np.clip(move_p*(.65+energy/140),.03,.92)
+                movers=rng.random(n)<move_p
+                move_strength=corner_cap+rng.normal(0,noise)-np.maximum(0,55-energy)*.06
+                shift=np.where(movers,np.clip(np.round((move_strength-4.5)/2),0,3),0).astype(int)
+                move_count+=shift
+                rank=np.maximum(1,rank-shift)
+                energy-=movers*(.7+shift*.65+np.maximum(0,6-corner_cap)*.20)
+                event_counts[("THIRD_CORNER","MOVE")]=event_counts.get(("THIRD_CORNER","MOVE"),0)+int(movers.sum())
+
+                # FOURTH_CORNER_EXIT: position, velocity, energy — no final result yet
+                front_bonus=np.where(np.arange(n)==leader,1.5,0)
+                velocity=.38*cruise_cap+.42*corner_cap+.20*pos_cap+front_bonus-.32*pressure-.055*np.maximum(0,60-energy)
+                if branch=="S3-L":
+                    velocity+=.28*straight_cap-.18*start_cap
+                if branch=="S3-Fb":
+                    velocity+=front_zone*.75
+                corner_score=velocity-.42*rank+rng.normal(0,noise*.42)
+                corner_order=np.argsort(-corner_score); corner_rank=np.empty(n,int); corner_rank[corner_order]=np.arange(1,n+1)
+
+                # Straight uses ability after structure is fixed
+                blocked=rng.random(n)<np.clip(d["進路詰まり率"].to_numpy(float)+trapped*.12+wide*.04,.02,.80)
+                fade_p=np.clip(d["ラスト失速率"].to_numpy(float)+np.maximum(0,55-energy)/100+pressure*.025,.03,.95)
+                faded=rng.random(n)<fade_p
+                effective_straight=(.54*straight_cap+.24*vmax_cap+.22*corner_cap)*(energy/100)
+                final_score=.28*corner_score+.72*effective_straight-blocked*rng.uniform(.5,1.7,n)-faded*rng.uniform(.7,2.2,n)+rng.normal(0,noise*.35)
+                finish_order=np.argsort(-final_score); finish_rank=np.empty(n,int); finish_rank[finish_order]=np.arange(1,n+1)
+
+                for i,row in d.iterrows():
+                    k=int(row["馬番"]); a=horse_acc[k]
+                    a["corner"].append(int(corner_rank[i])); a["finish"].append(int(finish_rank[i]))
+                    a["energy"].append(float(energy[i])); a["pressure"].append(float(pressure[i]))
+                    a["moves"].append(int(move_count[i])); a["blocked"].append(int(blocked[i])); a["faded"].append(int(faded[i]))
+                    if corner_rank[i]==1: a["lead"]+=1
+
+        for _,row in d.iterrows():
+            k=int(row["馬番"]); a=horse_acc[k]
+            summaries.append({
+                "シナリオ":sid,"馬番":k,"馬名":row["馬名"],
+                "4角順位平均":np.mean(a["corner"]),"4角順位SD":np.std(a["corner"]),
+                "4角先頭率":a["lead"]/total,"4角3位内率":np.mean(np.array(a["corner"])<=3),
+                "4角残存エネルギー平均":np.mean(a["energy"]),"累積圧力平均":np.mean(a["pressure"]),
+                "3角進出回数平均":np.mean(a["moves"]),
+                "勝率":np.mean(np.array(a["finish"])==1),"複勝率":np.mean(np.array(a["finish"])<=3),
+                "平均着順":np.mean(a["finish"]),"実測進路不発率":np.mean(a["blocked"]),
+                "実測失速率":np.mean(a["faded"])
+            })
+        for (segment,event),count in event_counts.items():
+            event_rows.append({"シナリオ":sid,"区間":segment,"イベント":event,"1試行平均回数":count/total})
+        for branch,count in branch_counts.items():
+            branch_rows.append({"シナリオ":sid,"内部分岐":branch,"発生率":count/total})
+    return pd.DataFrame(summaries),pd.DataFrame(event_rows),pd.DataFrame(branch_rows)
+
+def audit(res,inp,event_log,branches):
     rows=[]
     for a,b in [("S1","S2"),("S1","S3"),("S2","S3")]:
-      x=res[res["シナリオ"]==a].set_index("馬番"); y=res[res["シナリオ"]==b].set_index("馬番"); c=x.index.intersection(y.index)
-      corr=x.loc[c,"4角順位平均"].corr(y.loc[c,"4角順位平均"]) if len(c)>=3 else np.nan
-      overlap=len(set(x.nsmallest(min(5,len(x)),"平均着順").index)&set(y.nsmallest(min(5,len(y)),"平均着順").index))
-      pa=inp[inp["シナリオ"]==a]["前列圧被害EV"].mean(); pb=inp[inp["シナリオ"]==b]["前列圧被害EV"].mean(); diff=abs(pa-pb)
-      status="NG: 分離不足" if pd.notna(corr) and corr>=.94 and overlap>=5 and diff<.55 else ("WARN" if pd.notna(corr) and corr>=.88 and overlap>=4 else "OK")
-      rows.append({"比較":f"{a}-{b}","4角順位相関":corr,"上位5頭重複":overlap,"平均前列圧差":diff,"判定":status})
+        x=res[res["シナリオ"]==a].set_index("馬番"); y=res[res["シナリオ"]==b].set_index("馬番")
+        c=x.index.intersection(y.index)
+        corr=x.loc[c,"4角順位平均"].corr(y.loc[c,"4角順位平均"]) if len(c)>=3 else np.nan
+        lead_a=x["4角先頭率"].idxmax() if len(x) else None
+        lead_b=y["4角先頭率"].idxmax() if len(y) else None
+        ea=event_log[event_log["シナリオ"]==a].set_index(["区間","イベント"])["1試行平均回数"]
+        eb=event_log[event_log["シナリオ"]==b].set_index(["区間","イベント"])["1試行平均回数"]
+        idx=ea.index.union(eb.index); va=ea.reindex(idx,fill_value=0); vb=eb.reindex(idx,fill_value=0)
+        process_diff=float(np.abs(va-vb).mean()) if len(idx) else 0
+        same_leader=lead_a==lead_b
+        if pd.notna(corr) and corr>=.96 and process_diff<.18:
+            status="NG: 過程分離不足"
+        elif pd.notna(corr) and corr>=.90 and process_diff<.30:
+            status="WARN"
+        else:
+            status="OK"
+        rows.append({"比較":f"{a}-{b}","4角順位相関":corr,"過程差":process_diff,
+                     "4角首位候補同一":same_leader,"首位候補":f"{lead_a}/{lead_b}","判定":status})
+    # S3 internal branch existence
+    s3=set(branches.loc[branches["シナリオ"]=="S3","内部分岐"]) if not branches.empty else set()
+    rows.append({"比較":"S3内部","4角順位相関":np.nan,"過程差":np.nan,
+                 "4角首位候補同一":"-","首位候補":",".join(sorted(s3)),
+                 "判定":"OK" if {"S3-Fa","S3-Fb","S3-L"}.issubset(s3) else "NG: S3分岐欠落"})
     return pd.DataFrame(rows)
-
 st.set_page_config(page_title="OADPシナリオ分離シミュレーター",layout="wide")
 st.title("OADP シナリオ分離型レースシミュレーター")
 st.caption(f"Parser version: {APP_VERSION}")
@@ -566,7 +740,7 @@ with tabs[0]:
             else:
                 st.session_state["race"] = race
                 st.session_state["base"] = base
-                for key in ("world", "inputs", "result", "audit"):
+                for key in ("world", "inputs", "result", "event_log", "branches", "audit"):
                     st.session_state.pop(key, None)
                 st.success(f"{len(base)}頭の基礎数値を生成しました。")
         except Exception as e:
@@ -585,8 +759,8 @@ with tabs[2]:
         st.error(msg)
       if st.button("S1/S2/S3生成・実行",type="primary",disabled=not ok):
         try:
-          b,w=worlds(st.session_state["base"]); i=scenario_inputs(b,w); r=simulate(i,trials,seeds); a=audit(r,i)
-          st.session_state.update(world=w,inputs=i,result=r,audit=a)
+          b,w=worlds(st.session_state["base"]); i=scenario_inputs(b,w); r,e,br=simulate(i,trials,seeds); a=audit(r,i,e,br)
+          st.session_state.update(world=w,inputs=i,result=r,event_log=e,branches=br,audit=a)
         except Exception as e:
           st.error(f"シミュレーション実行に失敗しました: {type(e).__name__}: {e}")
       if "world" in st.session_state:
@@ -594,11 +768,17 @@ with tabs[2]:
         st.caption("OADP Ver.2.35：展開構造を先に生成し、S1/S2/S3で別の4角到達式を適用。人気・オッズは不使用。")
         st.dataframe(st.session_state["world"],use_container_width=True)
         st.subheader("全頭×S1/S2/S3入力"); st.dataframe(st.session_state["inputs"],use_container_width=True)
-        st.subheader("結果"); st.dataframe(st.session_state["result"].sort_values(["シナリオ","平均着順"]),use_container_width=True)
+        st.subheader("4角出口・直線結果")
+        st.dataframe(st.session_state["result"].sort_values(["シナリオ","4角順位平均"]),use_container_width=True)
+        st.subheader("区間イベント集計")
+        st.dataframe(st.session_state["event_log"],use_container_width=True)
+        st.subheader("S3内部分岐")
+        st.dataframe(st.session_state["branches"],use_container_width=True)
         st.subheader("独立監査"); st.dataframe(st.session_state["audit"],use_container_width=True)
         if st.session_state["audit"]["判定"].str.startswith("NG").any(): st.error("分離監査NG。係数または入力世界の再調整が必要です。")
         export={"race":st.session_state.get("race",{}),"worlds":st.session_state["world"].to_dict("records"),
                 "scenario_inputs":st.session_state["inputs"].to_dict("records"),"results":st.session_state["result"].to_dict("records"),
+                "event_log":st.session_state["event_log"].to_dict("records"),"branches":st.session_state["branches"].to_dict("records"),
                 "audit":st.session_state["audit"].to_dict("records"),"notice":"試作モデルのDERIVED/ESTIMATE"}
         st.download_button("結果JSON",json.dumps(export,ensure_ascii=False,indent=2).encode(),"oadp_simulation.json","application/json")
 st.divider()

@@ -1,0 +1,17 @@
+OADPイベント駆動エンジン v0.4.0 実装契約
+
+固定区間:
+START
+EARLY_POSITION
+FIRST_CORNER
+MID_CRUISE
+THIRD_CORNER
+FOURTH_CORNER_EXIT
+
+能力後入れ:
+4角出口の位置・速度・残存エネルギーを確定するまで、STRAIGHT_CAPACITYとVMAX_CAPACITYは着順形成に使用しない。
+直線処理で初めて有効能力 = 局所能力 × 残存率 として使用する。
+
+未知量:
+未知量を固定値へ潰さず、発生条件つきイベントとして各試行で抽選する。
+人気・オッズ・人気順位は、物理計算・シナリオ発生率・イベント分岐へ使用しない。
