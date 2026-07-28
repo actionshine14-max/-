@@ -1,0 +1,90 @@
+{
+  "version": "1.3",
+  "modes": {
+    "AI_TEXT": {
+      "description": "AIが出力したテキストファイルからペースレンジと根拠を読み込み、そのまま計算",
+      "flow": [
+        "テキスト読込",
+        "構文解析",
+        "必須項目監査",
+        "シナリオ別ペースレンジ生成",
+        "Stage1再計算",
+        "Stage2再計算",
+        "全着順確率",
+        "印候補"
+      ]
+    },
+    "MANUAL": {
+      "description": "使用者がペース、区間速度、圧力、隊列伸縮を手動入力して計算",
+      "flow": [
+        "手動入力",
+        "入力範囲監査",
+        "相互作用再計算",
+        "Stage1再計算",
+        "Stage2再計算",
+        "全着順確率",
+        "印候補"
+      ]
+    },
+    "AI_TEXT_WITH_MANUAL_OVERRIDE": {
+      "description": "AI値を初期値として保持し、使用者が任意項目だけ上書きして再計算",
+      "flow": [
+        "AIテキスト読込",
+        "AI原値保存",
+        "手動差分適用",
+        "影響範囲判定",
+        "Stage1以降を再計算",
+        "変更前後比較",
+        "全着順確率",
+        "印候補"
+      ]
+    }
+  },
+  "manual_editable_fields": [
+    "scenario_probability",
+    "pace_label",
+    "section.field_velocity_mps",
+    "section.pace_intensity",
+    "section.pressure_density",
+    "section.leader_margin_m",
+    "section.field_stretch_m",
+    "section.position_change_rate",
+    "front_group_members",
+    "interaction_group_ids"
+  ],
+  "important_rules": [
+    "手動変更は点値ではなく原則 min/mode/max のレンジで入力",
+    "AI値は削除せず原値として保存",
+    "変更項目・変更理由・時刻・再計算範囲を監査ログへ保存",
+    "ペース変更時は馬単体だけでなく全馬相互作用を再計算",
+    "前半ペース変更はStage1から必ず再計算",
+    "4角以降だけの変更でも、4角状態との整合性監査を通す",
+    "変更前と変更後の全着順確率差分を出力"
+  ],
+  "recommended_ui": {
+    "source_selector": [
+      "AIテキスト",
+      "手動入力",
+      "AI値を手動上書き"
+    ],
+    "pace_controls": [
+      "シナリオ選択",
+      "区間選択",
+      "下限",
+      "中心値",
+      "上限",
+      "分布形",
+      "先行集団",
+      "競合グループ",
+      "再計算ボタン"
+    ],
+    "comparison_outputs": [
+      "AI原値",
+      "手動変更値",
+      "差分",
+      "変更前全着順確率",
+      "変更後全着順確率",
+      "印候補変化"
+    ]
+  }
+}

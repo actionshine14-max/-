@@ -1,0 +1,246 @@
+{
+  "title": "OADP Race Pace Dual Input Contract v1.3",
+  "type": "object",
+  "required": [
+    "pace_source_mode",
+    "ai_pace_input",
+    "manual_override_policy"
+  ],
+  "properties": {
+    "pace_source_mode": {
+      "enum": [
+        "AI_TEXT",
+        "MANUAL",
+        "AI_TEXT_WITH_MANUAL_OVERRIDE"
+      ]
+    },
+    "ai_pace_input": {
+      "type": "object",
+      "properties": {
+        "source_file_name": {
+          "type": "string"
+        },
+        "source_hash": {
+          "type": "string"
+        },
+        "parsed_at": {
+          "type": "string"
+        },
+        "pace_ranges_by_scenario": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scenario_pace"
+          }
+        }
+      }
+    },
+    "manual_override_policy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "override_scope": {
+          "enum": [
+            "GLOBAL_ONLY",
+            "SCENARIO_ONLY",
+            "SECTION_ONLY",
+            "HORSE_INTERACTION_ONLY",
+            "ANY"
+          ]
+        },
+        "preserve_original_ai_values": {
+          "type": "boolean"
+        },
+        "require_reason": {
+          "type": "boolean"
+        },
+        "recalculate_all_stages": {
+          "type": "boolean"
+        }
+      }
+    },
+    "manual_inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/manual_change"
+      }
+    }
+  },
+  "$defs": {
+    "range": {
+      "type": "object",
+      "required": [
+        "min",
+        "mode",
+        "max",
+        "distribution",
+        "confidence"
+      ],
+      "properties": {
+        "min": {
+          "type": "number"
+        },
+        "mode": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "distribution": {
+          "enum": [
+            "PERT",
+            "TRIANGULAR",
+            "TRUNCATED_NORMAL",
+            "UNIFORM",
+            "BETA_SCALED"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "section_pace": {
+      "type": "object",
+      "required": [
+        "section_id",
+        "distance_start_m",
+        "distance_end_m",
+        "field_velocity_mps",
+        "pace_intensity",
+        "pressure_density"
+      ],
+      "properties": {
+        "section_id": {
+          "type": "string"
+        },
+        "distance_start_m": {
+          "type": "number"
+        },
+        "distance_end_m": {
+          "type": "number"
+        },
+        "field_velocity_mps": {
+          "$ref": "#/$defs/range"
+        },
+        "pace_intensity": {
+          "$ref": "#/$defs/range"
+        },
+        "pressure_density": {
+          "$ref": "#/$defs/range"
+        },
+        "leader_margin_m": {
+          "$ref": "#/$defs/range"
+        },
+        "field_stretch_m": {
+          "$ref": "#/$defs/range"
+        },
+        "position_change_rate": {
+          "$ref": "#/$defs/range"
+        }
+      }
+    },
+    "scenario_pace": {
+      "type": "object",
+      "required": [
+        "scenario_id",
+        "scenario_probability",
+        "sections"
+      ],
+      "properties": {
+        "scenario_id": {
+          "enum": [
+            "S1",
+            "S2",
+            "S3_FA",
+            "S3_FB",
+            "S3_L"
+          ]
+        },
+        "scenario_probability": {
+          "$ref": "#/$defs/range"
+        },
+        "pace_label": {
+          "enum": [
+            "VERY_SLOW",
+            "SLOW",
+            "MIDDLE",
+            "FAST",
+            "VERY_FAST",
+            "CUSTOM"
+          ]
+        },
+        "sections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/section_pace"
+          }
+        },
+        "front_group_members": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "interaction_group_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "derivation_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "manual_change": {
+      "type": "object",
+      "required": [
+        "change_id",
+        "target_path",
+        "new_value",
+        "changed_by",
+        "changed_at"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string"
+        },
+        "target_path": {
+          "type": "string"
+        },
+        "old_value": {},
+        "new_value": {},
+        "reason": {
+          "type": "string"
+        },
+        "changed_by": {
+          "type": "string"
+        },
+        "changed_at": {
+          "type": "string"
+        },
+        "recalculate_from_stage": {
+          "enum": [
+            "SCENARIO_BUILD",
+            "STAGE1",
+            "STAGE2",
+            "MARKS_ONLY"
+          ]
+        }
+      }
+    }
+  }
+}
