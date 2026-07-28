@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from oadp_engine import parse_nar_html
 
-APP_VERSION="0.4.0-event-driven"
+APP_VERSION="0.4.1-position-state"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -473,20 +473,35 @@ def _choose_s3_branch(row,rng):
     p=p/p.sum()
     return rng.choice(["S3-Fa","S3-Fb","S3-L"],p=p)
 
+def _rank_from_position(position, rng, jitter=.015):
+    """連続位置から重複のない順位を作る。小さい値ほど前。"""
+    score=np.asarray(position,float)+rng.normal(0,jitter,len(position))
+    order=np.argsort(score,kind="mergesort")
+    rank=np.empty(len(position),int); rank[order]=np.arange(1,len(position)+1)
+    return rank
+
+def _weighted_choice(rng, weights):
+    w=np.asarray(weights,float)
+    w=np.clip(w,1e-9,None); w=w/w.sum()
+    return int(rng.choice(np.arange(len(w)),p=w))
+
 def simulate(inp,trials,seeds):
-    """条件付きイベント型Monte Carlo。各試行で発馬・主張・抵抗・圧力・息入れ・3角進出を発生させる。"""
+    """イベント型Monte Carlo v0.4.1。
+    重要: シナリオ差を消耗係数だけでなく、各区間の連続位置 state へ直接反映する。
+    """
     summaries=[]; event_rows=[]; branch_rows=[]
     for sid in SCENARIOS:
         d=inp[inp["シナリオ"]==sid].reset_index(drop=True)
         n=len(d); per=max(20,trials//max(1,seeds)); total=per*seeds
-        horse_acc={int(r["馬番"]):{"corner":[],"finish":[],"energy":[],"pressure":[],"moves":[],"blocked":[],"faded":[],"lead":0} for _,r in d.iterrows()}
-        event_counts={}
-        branch_counts={}
+        horse_acc={int(r["馬番"]):{"corner":[],"finish":[],"energy":[],"pressure":[],"moves":[],"blocked":[],"faded":[],"lead":0,
+                                    "zone_front":0,"zone_stalk":0,"zone_mid":0,"zone_back":0} for _,r in d.iterrows()}
+        event_counts={}; branch_counts={}
         for seed in range(seeds):
             rng=np.random.default_rng(20260726+seed*1009+SCENARIOS.index(sid)*100003)
             for _ in range(per):
                 branch=sid if sid!="S3" else _choose_s3_branch(d.iloc[0],rng)
                 branch_counts[branch]=branch_counts.get(branch,0)+1
+
                 start_cap=d["START_CAPACITY"].to_numpy(float)
                 cruise_cap=d["CRUISE_CAPACITY"].to_numpy(float)
                 pos_cap=d["POSITION_CAPACITY"].to_numpy(float)
@@ -497,123 +512,190 @@ def simulate(inp,trials,seeds):
                 vmax_cap=d["VMAX_CAPACITY"].to_numpy(float)
                 conf=d["入力信頼度"].to_numpy(float)/10
                 noise=.28+(1-conf)*.65
+                inner=d["内枠優位"].to_numpy(float)
+                light=np.clip(5+(57-d["斤量"].to_numpy(float))*1.2,0,10)
 
                 energy=np.ones(n)*100.0
                 pressure=np.zeros(n)
                 move_count=np.zeros(n,int)
 
-                # START
+                # START: 発馬・先行参加・主張を抽選
                 miss=rng.random(n)<d["出遅れ推定率"].to_numpy(float)
-                start_perf=start_cap+rng.normal(0,noise)-miss*rng.uniform(.8,2.1,n)
+                start_perf=start_cap+rng.normal(0,noise)-miss*rng.uniform(.9,2.3,n)
                 participants=rng.random(n)<d["先行参加率"].to_numpy(float)
-                if branch=="S3-Fb":
-                    # 競るはずの一部が控える
-                    front_idx=np.where(participants)[0]
-                    if len(front_idx)>1:
-                        drop=rng.choice(front_idx,size=max(1,len(front_idx)//2),replace=False)
-                        participants[drop]=False
                 if not participants.any():
                     participants[np.argmax(start_perf)]=True
-                claim_score=np.where(participants,start_perf+.35*d["主張EV"].to_numpy(float),-999)
-                leader=int(np.argmax(claim_score))
-                order=np.argsort(-start_perf)
-                rank=np.empty(n,int); rank[order]=np.arange(1,n+1)
+
+                claim=np.exp((start_perf-5)/1.8) * (0.35+0.65*d["ハナ取得確率"].to_numpy(float)*n)
+                claim=np.where(participants,claim,1e-9)
+
+                # S3-Fbは「本来競る馬が控え、別の前受け馬が主導」を位置 state で作る
+                if branch=="S3-Fb":
+                    strong=np.argsort(-claim)[:max(1,min(2,n))]
+                    participants[strong]=False
+                    alt_score=(.34*start_cap+.28*inner+.22*light+.16*pos_cap
+                               -1.0*(d["ハナ取得確率"].to_numpy(float)*10))
+                    eligible=np.where(~miss)[0]
+                    if len(eligible):
+                        leader=int(eligible[np.argmax(alt_score[eligible]+rng.normal(0,.35,len(eligible)))])
+                    else:
+                        leader=int(np.argmax(alt_score))
+                    participants[leader]=True
+                else:
+                    leader=_weighted_choice(rng,claim)
+
+                # 連続位置。旧版の rank を使い回さず、イベントごとに更新する。
+                base_order=np.argsort(-start_perf)
+                pos=np.empty(n,float); pos[base_order]=np.arange(1,n+1,dtype=float)
+                pos-=participants*rng.uniform(.35,1.05,n)
+                pos[miss]+=rng.uniform(1.0,2.4,miss.sum())
+                pos[leader]=0.35
+
                 energy-=2.0+np.maximum(0,7-start_cap)*.20
                 energy[participants]-=rng.uniform(.5,1.4,participants.sum())
                 event_counts[("START","MISS")]=event_counts.get(("START","MISS"),0)+int(miss.sum())
                 event_counts[("START","CLAIM")]=event_counts.get(("START","CLAIM"),0)+int(participants.sum())
 
-                # EARLY_POSITION: pairwise pressure and reaction
+                # EARLY_POSITION: 競争の成否が位置そのものを変える
                 contenders=[i for i in np.where(participants)[0] if i!=leader]
-                if sid=="S1":
-                    attack_p=.18
-                elif sid=="S2":
-                    attack_p=.72
-                elif branch=="S3-Fa":
-                    attack_p=.78
-                elif branch=="S3-Fb":
-                    attack_p=.10
-                else:
-                    attack_p=.45
+                if sid=="S1": attack_p=.14
+                elif sid=="S2": attack_p=.78
+                elif branch=="S3-Fa": attack_p=.84
+                elif branch=="S3-Fb": attack_p=.06
+                else: attack_p=.58
+
                 for i in contenders:
                     if rng.random()<attack_p:
-                        resist_p=logistic((d.iloc[leader]["抵抗EV"]-5)/1.1)
-                        resisted=rng.random()<resist_p
-                        intensity=rng.uniform(.6,1.4)*float(d.iloc[i]["圧力倍率"])
+                        intensity=rng.uniform(.75,1.55)*float(d.iloc[i]["圧力倍率"])
                         pressure[leader]+=intensity
-                        pressure[i]+=intensity*.72
+                        pressure[i]+=intensity*.76
                         energy[leader]-=(1.0+max(0,intensity-press_cap[leader]/7)**2)
-                        energy[i]-=(.8+max(0,intensity-press_cap[i]/7)**2)
+                        energy[i]-=(.85+max(0,intensity-press_cap[i]/7)**2)
+                        resist_p=logistic((d.iloc[leader]["抵抗EV"]-d.iloc[i]["主張EV"])/1.15)
+                        resisted=rng.random()<resist_p
                         event_counts[("EARLY_POSITION","OUTSIDE_PRESS")]=event_counts.get(("EARLY_POSITION","OUTSIDE_PRESS"),0)+1
-                        if not resisted and claim_score[i]>claim_score[leader]-.4:
-                            leader=i
+                        if resisted:
+                            pos[leader]=min(pos[leader],.40)
+                            pos[i]=min(pos[i],1.10+rng.uniform(0,.55))
+                        else:
+                            old=leader; leader=i
+                            pos[leader]=.35
+                            pos[old]=1.15+rng.uniform(0,.70)
                             event_counts[("EARLY_POSITION","LEAD_CHANGE")]=event_counts.get(("EARLY_POSITION","LEAD_CHANGE"),0)+1
+                    else:
+                        # 控える馬は番手〜好位へ落ち着く
+                        pos[i]=max(pos[i],1.2+rng.uniform(0,2.0))
 
-                # FIRST_CORNER: lane loss / trap
-                trapped=rng.random(n)<d["内包まれ率"].to_numpy(float)*(1.0 if branch!="S3-L" else .75)
+                if sid=="S1":
+                    # 自然隊列: 主導馬を固定し、競合は隊列化
+                    pos[leader]=.25
+                    for j,i in enumerate(sorted(contenders,key=lambda x:pos[x])):
+                        pos[i]=max(pos[i],1.20+j*.75+rng.uniform(0,.25))
+                elif sid=="S2" or branch=="S3-Fa":
+                    # 横広がり: 複数馬が前列へ残りやすい
+                    front_candidates=np.where(participants)[0]
+                    pos[front_candidates]=np.minimum(pos[front_candidates],
+                        rng.uniform(.35,max(1.25,1.25+.18*len(front_candidates)),len(front_candidates)))
+
+                # FIRST_CORNER
+                trapped=rng.random(n)<d["内包まれ率"].to_numpy(float)*(0.75 if branch=="S3-L" else 1.0)
                 wide=rng.random(n)<d["外回し率"].to_numpy(float)
-                rank=rank+trapped.astype(int)-wide.astype(int)*0
+                pos+=trapped*rng.uniform(.25,.85,n)
+                pos+=wide*rng.uniform(.08,.40,n)
                 energy-=wide*rng.uniform(.4,1.1,n)
                 event_counts[("FIRST_CORNER","TRAPPED")]=event_counts.get(("FIRST_CORNER","TRAPPED"),0)+int(trapped.sum())
                 event_counts[("FIRST_CORNER","WIDE")]=event_counts.get(("FIRST_CORNER","WIDE"),0)+int(wide.sum())
 
-                # MID_CRUISE: pace load and recovery
-                front_zone=rank<=max(3,math.ceil(n*.30))
-                pace_load=(1.1 if sid=="S1" else 1.7 if sid=="S2" else 1.5 if branch=="S3-Fa" else .9 if branch=="S3-Fb" else 1.65)
-                demand=pace_load+front_zone*.7+pressure*.28
+                # MID_CRUISE: 現在位置から前列を再判定（旧版はSTART時rank固定だった）
+                rank_mid=_rank_from_position(pos,rng)
+                front_zone=rank_mid<=max(3,math.ceil(n*.30))
+                pace_load=(1.05 if sid=="S1" else 1.85 if sid=="S2" else
+                           1.75 if branch=="S3-Fa" else .82 if branch=="S3-Fb" else 1.78)
+                demand=pace_load+front_zone*.7+pressure*.30
                 overload=np.maximum(0,demand-cruise_cap/5.2)
                 energy-=1.4+demand*.55+overload**2
                 recover=(~front_zone)*recovery_cap/10*rng.uniform(.5,1.2,n)
-                if branch=="S3-Fb": recover+=front_zone*recovery_cap/10*.55
+                if branch=="S3-Fb":
+                    recover+=front_zone*recovery_cap/10*.72
+                    # 縦隊列を強化
+                    pos=np.sort(pos)[rank_mid-1] + (rank_mid-1)*.05
                 energy+=recover
                 event_counts[("MID_CRUISE","RECOVERY")]=event_counts.get(("MID_CRUISE","RECOVERY"),0)+int((recover>.5).sum())
 
-                # THIRD_CORNER: conditional moves
+                # THIRD_CORNER: 後方接続/前残りを位置へ直接反映
+                rank3=_rank_from_position(pos,rng)
                 if branch=="S3-Fb":
-                    move_p=.12+.22*d["3角進出EV"].to_numpy(float)/10
+                    move_p=.08+.18*d["3角進出EV"].to_numpy(float)/10
                 elif branch=="S3-L":
-                    move_p=.30+.55*d["差し接続EV"].to_numpy(float)/10
+                    move_p=.25+.62*d["差し接続EV"].to_numpy(float)/10
+                elif sid=="S2" or branch=="S3-Fa":
+                    move_p=.18+.46*d["3角進出EV"].to_numpy(float)/10
                 else:
-                    move_p=.20+.42*d["3角進出EV"].to_numpy(float)/10
-                move_p=np.clip(move_p*(.65+energy/140),.03,.92)
+                    move_p=.13+.32*d["3角進出EV"].to_numpy(float)/10
+                move_p=np.clip(move_p*(.60+energy/135),.02,.94)
+                if branch=="S3-L":
+                    move_p=np.clip(move_p + (rank3>max(3,n*.35))*.16,.02,.96)
                 movers=rng.random(n)<move_p
                 move_strength=corner_cap+rng.normal(0,noise)-np.maximum(0,55-energy)*.06
-                shift=np.where(movers,np.clip(np.round((move_strength-4.5)/2),0,3),0).astype(int)
-                move_count+=shift
-                rank=np.maximum(1,rank-shift)
-                energy-=movers*(.7+shift*.65+np.maximum(0,6-corner_cap)*.20)
+                shift=np.where(movers,np.clip((move_strength-4.2)/1.55,0,3.5),0)
+                if branch=="S3-L":
+                    shift*=np.where(rank3>max(3,n*.35),1.35,.70)
+                if branch=="S3-Fb":
+                    shift*=.55
+                move_count+=np.round(shift).astype(int)
+                pos-=shift
+                energy-=movers*(.7+shift*.62+np.maximum(0,6-corner_cap)*.20)
                 event_counts[("THIRD_CORNER","MOVE")]=event_counts.get(("THIRD_CORNER","MOVE"),0)+int(movers.sum())
 
-                # FOURTH_CORNER_EXIT: position, velocity, energy — no final result yet
-                front_bonus=np.where(np.arange(n)==leader,1.5,0)
-                velocity=.38*cruise_cap+.42*corner_cap+.20*pos_cap+front_bonus-.32*pressure-.055*np.maximum(0,60-energy)
+                # FOURTH_CORNER_EXIT
+                rank_pre4=_rank_from_position(pos,rng)
+                front_now=rank_pre4<=max(3,math.ceil(n*.30))
+                velocity=.34*cruise_cap+.42*corner_cap+.24*pos_cap-.34*pressure-.060*np.maximum(0,60-energy)
+                velocity[leader]+=1.15
                 if branch=="S3-L":
-                    velocity+=.28*straight_cap-.18*start_cap
-                if branch=="S3-Fb":
-                    velocity+=front_zone*.75
-                corner_score=velocity-.42*rank+rng.normal(0,noise*.42)
-                corner_order=np.argsort(-corner_score); corner_rank=np.empty(n,int); corner_rank[corner_order]=np.arange(1,n+1)
+                    velocity+=.36*straight_cap-.22*start_cap
+                    velocity+=np.where(~front_now,.38,-.28)
+                elif branch=="S3-Fb":
+                    velocity+=np.where(front_now,.92,-.18)
+                elif sid=="S2" or branch=="S3-Fa":
+                    velocity+=np.where(front_now,-.22,.20)
 
-                # Straight uses ability after structure is fixed
+                # 位置を主、速度を補助にする。旧版は stale rank と能力scoreが支配していた。
+                corner_metric=pos-.24*velocity+rng.normal(0,noise*.16)
+                corner_rank=_rank_from_position(corner_metric,rng,jitter=.01)
+                corner_order=np.argsort(corner_rank)
+                leader4=int(corner_order[0])
+
                 blocked=rng.random(n)<np.clip(d["進路詰まり率"].to_numpy(float)+trapped*.12+wide*.04,.02,.80)
                 fade_p=np.clip(d["ラスト失速率"].to_numpy(float)+np.maximum(0,55-energy)/100+pressure*.025,.03,.95)
                 faded=rng.random(n)<fade_p
                 effective_straight=(.54*straight_cap+.24*vmax_cap+.22*corner_cap)*(energy/100)
-                final_score=.28*corner_score+.72*effective_straight-blocked*rng.uniform(.5,1.7,n)-faded*rng.uniform(.7,2.2,n)+rng.normal(0,noise*.35)
+                final_score=-.34*corner_rank+.66*effective_straight-blocked*rng.uniform(.5,1.7,n)-faded*rng.uniform(.7,2.2,n)+rng.normal(0,noise*.35)
                 finish_order=np.argsort(-final_score); finish_rank=np.empty(n,int); finish_rank[finish_order]=np.arange(1,n+1)
 
                 for i,row in d.iterrows():
                     k=int(row["馬番"]); a=horse_acc[k]
-                    a["corner"].append(int(corner_rank[i])); a["finish"].append(int(finish_rank[i]))
+                    cr=int(corner_rank[i])
+                    a["corner"].append(cr); a["finish"].append(int(finish_rank[i]))
                     a["energy"].append(float(energy[i])); a["pressure"].append(float(pressure[i]))
                     a["moves"].append(int(move_count[i])); a["blocked"].append(int(blocked[i])); a["faded"].append(int(faded[i]))
-                    if corner_rank[i]==1: a["lead"]+=1
+                    if cr==1: a["lead"]+=1
+                    if cr<=max(2,math.ceil(n*.15)): a["zone_front"]+=1
+                    elif cr<=max(4,math.ceil(n*.35)): a["zone_stalk"]+=1
+                    elif cr<=max(6,math.ceil(n*.70)): a["zone_mid"]+=1
+                    else: a["zone_back"]+=1
 
         for _,row in d.iterrows():
             k=int(row["馬番"]); a=horse_acc[k]
+            zone_rates=np.array([a["zone_front"],a["zone_stalk"],a["zone_mid"],a["zone_back"]],float)/total
+            zone_names=["先頭圏","好位圏","中団圏","後方圏"]
             summaries.append({
                 "シナリオ":sid,"馬番":k,"馬名":row["馬名"],
                 "4角順位平均":np.mean(a["corner"]),"4角順位SD":np.std(a["corner"]),
+                "4角順位中央値":np.median(a["corner"]),
+                "4角最頻位置帯":zone_names[int(np.argmax(zone_rates))],
+                "4角先頭圏率":zone_rates[0],"4角好位圏率":zone_rates[1],
+                "4角中団圏率":zone_rates[2],"4角後方圏率":zone_rates[3],
                 "4角先頭率":a["lead"]/total,"4角3位内率":np.mean(np.array(a["corner"])<=3),
                 "4角残存エネルギー平均":np.mean(a["energy"]),"累積圧力平均":np.mean(a["pressure"]),
                 "3角進出回数平均":np.mean(a["moves"]),
@@ -640,17 +722,25 @@ def audit(res,inp,event_log,branches):
         idx=ea.index.union(eb.index); va=ea.reindex(idx,fill_value=0); vb=eb.reindex(idx,fill_value=0)
         process_diff=float(np.abs(va-vb).mean()) if len(idx) else 0
         same_leader=lead_a==lead_b
-        if pd.notna(corr) and corr>=.96 and process_diff<.18:
+        order_a=list(x.sort_values("4角順位平均").index)
+        order_b=list(y.sort_values("4角順位平均").index)
+        exact_same_order=(order_a==order_b)
+        mean_abs_gap=float(np.mean(np.abs(x.loc[c,"4角順位平均"]-y.loc[c,"4角順位平均"]))) if len(c) else np.nan
+        if exact_same_order and pd.notna(mean_abs_gap) and mean_abs_gap<.12:
+            status="NG: 4角位置が実質同一"
+        elif pd.notna(corr) and corr>=.96 and process_diff<.18:
             status="NG: 過程分離不足"
         elif pd.notna(corr) and corr>=.90 and process_diff<.30:
             status="WARN"
         else:
             status="OK"
-        rows.append({"比較":f"{a}-{b}","4角順位相関":corr,"過程差":process_diff,
+        rows.append({"比較":f"{a}-{b}","4角順位相関":corr,"4角平均順位差":mean_abs_gap,
+                     "4角並び完全一致":exact_same_order,"過程差":process_diff,
                      "4角首位候補同一":same_leader,"首位候補":f"{lead_a}/{lead_b}","判定":status})
     # S3 internal branch existence
     s3=set(branches.loc[branches["シナリオ"]=="S3","内部分岐"]) if not branches.empty else set()
-    rows.append({"比較":"S3内部","4角順位相関":np.nan,"過程差":np.nan,
+    rows.append({"比較":"S3内部","4角順位相関":np.nan,"4角平均順位差":np.nan,
+                 "4角並び完全一致":"-","過程差":np.nan,
                  "4角首位候補同一":"-","首位候補":",".join(sorted(s3)),
                  "判定":"OK" if {"S3-Fa","S3-Fb","S3-L"}.issubset(s3) else "NG: S3分岐欠落"})
     return pd.DataFrame(rows)
