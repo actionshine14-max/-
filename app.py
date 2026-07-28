@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from oadp_engine import parse_nar_html
 
-APP_VERSION="0.4.1-position-state"
+APP_VERSION="0.5.0-oadp-contract-consumption"
 SCENARIOS=("S1","S2","S3")
 def clamp(x,lo=0.0,hi=10.0): return float(max(lo,min(hi,x)))
 def logistic(x): return 1/(1+math.exp(-x))
@@ -709,6 +709,216 @@ def simulate(inp,trials,seeds):
             branch_rows.append({"シナリオ":sid,"内部分岐":branch,"発生率":count/total})
     return pd.DataFrame(summaries),pd.DataFrame(event_rows),pd.DataFrame(branch_rows)
 
+
+def _extract_numbers(s):
+    return [int(x) for x in re.findall(r"\d{1,2}", str(s))]
+
+def parse_oadp_phase_contract(text, base):
+    """Phase0〜Phase3テキストから、S1/S2/S3の4角拘束と発生確率を抽出する。
+    対応対象は本アプリ出力フォーマット:
+      【シナリオ1...】/ 発生確率
+      4角出口〜直線入口：
+      先頭圏：...
+      番手圏：...
+      好位圏：...
+      中団接続圏：...
+      消耗圏：...
+      後方圏：...
+    """
+    if not text or not str(text).strip():
+        raise ValueError("OADP Phase0〜3テキストが空です。")
+    b=base.copy()
+    valid=set(pd.to_numeric(b["馬番"],errors="coerce").dropna().astype(int))
+    name_map={int(r["馬番"]):str(r["馬名"]) for _,r in b.iterrows()}
+    scen_map={"1":"S1","2":"S2","3":"S3"}
+    starts=[]
+    pat=re.compile(r"【シナリオ\s*([123])[^】]*】")
+    for m in pat.finditer(text):
+        starts.append((m.start(),scen_map[m.group(1)]))
+    if len(starts)<3:
+        # Phase1の通常見出しも許容
+        pat2=re.compile(r"【シナリオ\s*([123])[:：]")
+        starts=[]
+        for m in pat2.finditer(text):
+            starts.append((m.start(),scen_map[m.group(1)]))
+    if len(starts)<3:
+        raise ValueError("S1/S2/S3のシナリオ見出しを3件抽出できませんでした。")
+
+    zone_rank={"先頭圏":1.0,"番手圏":2.5,"好位圏":5.0,"中団接続圏":7.0,
+               "中団圏":7.0,"展開補助必要圏":8.5,"消耗圏":9.0,
+               "後方流入圏":9.0,"後方圏":10.5}
+    rows=[]; meta=[]
+    for idx,(stpos,sid) in enumerate(starts[:3]):
+        en=starts[idx+1][0] if idx+1<len(starts) else len(text)
+        block=text[stpos:en]
+        pm=re.search(r"発生確率[:：]\s*(\d+(?:\.\d+)?)\s*%",block)
+        prob=float(pm.group(1))/100 if pm else 1/3
+        if "競り継続" in block or "前列圧型" in block:
+            mode="HIGH_PRESSURE"
+        elif "無風主導" in block or "圧不発" in block:
+            mode="LOW_PRESSURE_FRONT"
+        else:
+            mode="NATURAL"
+        target={}
+        zlabel={}
+        # 4角出口以降だけを優先
+        q=block.find("4角出口")
+        tail=block[q:] if q>=0 else block
+        for z,base_rank in zone_rank.items():
+            mm=re.search(rf"{re.escape(z)}[:：]\s*([^\n\r]+)",tail)
+            if not mm: continue
+            nums=[n for n in _extract_numbers(mm.group(1)) if n in valid]
+            for j,n in enumerate(nums):
+                target[n]=base_rank+j*0.35
+                zlabel[n]=z
+        # 1行隊列表記へのフォールバック
+        if not target:
+            mm=re.search(r"4角出口[^：]*[:：]\s*\n?\s*([0-9,、 ＞>]+)",block)
+            if mm:
+                groups=re.split(r"[＞>]",mm.group(1))
+                r=1.0
+                for g in groups:
+                    nums=[n for n in _extract_numbers(g) if n in valid]
+                    for j,n in enumerate(nums):
+                        target[n]=r+j*.25; zlabel[n]="隊列指定"
+                    r+=max(1.5,len(nums)*.55)
+        if not target:
+            raise ValueError(f"{sid}の4角位置指定を抽出できませんでした。")
+        # 未記載馬は後方へ、ただし元データ順で安定化
+        missing=sorted(valid-set(target))
+        rear=max(target.values())+1.0
+        for j,n in enumerate(missing):
+            target[n]=rear+j*.45; zlabel[n]="未記載後方補完"
+        meta.append({"シナリオ":sid,"発生確率":prob,"圧力モード":mode,
+                     "抽出頭数":len(target),"原文先頭":block[:180].replace("\n"," ")})
+        for n in sorted(valid):
+            rows.append({"シナリオ":sid,"馬番":n,"馬名":name_map.get(n,""),
+                         "OADP目標4角位置":target[n],"OADP位置帯":zlabel[n],
+                         "シナリオ発生確率":prob,"圧力モード":mode})
+    c=pd.DataFrame(rows)
+    # 確率を正規化
+    probs=pd.DataFrame(meta)
+    s=probs["発生確率"].sum()
+    if s>0:
+        probs["発生確率"]/=s
+        pmap=dict(zip(probs["シナリオ"],probs["発生確率"]))
+        c["シナリオ発生確率"]=c["シナリオ"].map(pmap)
+    return c,probs
+
+def simulate_from_oadp_contract(base, contract, trials=3000, seeds=10, anchor_strength=.88):
+    """AI/OADPが決めた4角構造を上位契約として固定し、その内部で消耗・圧力・
+    位置揺らぎをMonte Carloする。人気・オッズは使用しない。
+    """
+    base=base.copy()
+    results=[]; components=[]; audits=[]
+    n=len(base)
+    per=max(20,int(trials)//max(1,int(seeds)))
+    total=per*max(1,int(seeds))
+    for sid in SCENARIOS:
+        d=base.merge(contract[contract["シナリオ"]==sid],on=["馬番","馬名"],how="inner")
+        if len(d)!=len(base):
+            raise ValueError(f"{sid}: 基礎データとOADP契約の馬番が一致しません。")
+        acc={int(r["馬番"]):{"rank":[],"energy":[],"cons":[],"pressure":[],
+             "start":[],"early":[],"corner1":[],"cruise":[],"third":[],"fourth":[]} for _,r in d.iterrows()}
+        mode=str(d.iloc[0]["圧力モード"])
+        for seed in range(max(1,int(seeds))):
+            rng=np.random.default_rng(20260727+seed*1013+SCENARIOS.index(sid)*100019)
+            for _ in range(per):
+                # OADP順位を主状態とし、信頼度・能力に応じた局所揺らぎだけ許す
+                conf=d["入力信頼度"].to_numpy(float)/10
+                target=d["OADP目標4角位置"].to_numpy(float)
+                start=d["START_CAPACITY"].to_numpy(float)
+                cruise=d["CRUISE_CAPACITY"].to_numpy(float)
+                presscap=d["PRESSURE_CAPACITY"].to_numpy(float)
+                corner=d["CORNER_CAPACITY"].to_numpy(float)
+                recovery=d["RECOVERY_CAPACITY"].to_numpy(float)
+                outer=d["外枠負荷"].to_numpy(float)
+                trapped_p=d["内包まれ率"].to_numpy(float)
+                wide_p=d["外回し率"].to_numpy(float)
+
+                front=np.clip(1-(target-1)/max(1,n-1),0,1)
+                uncertainty=(1-conf)*1.25+(1-anchor_strength)*1.8
+                metric=target+rng.normal(0,uncertainty)
+                # 局所能力は順位を作り直さず、契約周辺の微小補正だけ
+                metric-= (corner-5)*.075+(d["POSITION_CAPACITY"].to_numpy(float)-5)*.045
+                order=np.argsort(metric,kind="mergesort")
+                rank=np.empty(n,int); rank[order]=np.arange(1,n+1)
+
+                if mode=="HIGH_PRESSURE":
+                    press_level=1.25+2.15*front
+                elif mode=="LOW_PRESSURE_FRONT":
+                    press_level=.45+.55*front
+                else:
+                    press_level=.75+1.05*front
+                pressure=np.maximum(0,rng.normal(press_level,.28))
+                pressure*=np.clip(1.12-(presscap-5)*.035,.72,1.30)
+
+                # 区間別消耗。100は能力同一ではなく、残存率の基準。
+                c_start=2.0+np.maximum(0,6.5-start)*.22+rng.uniform(.25,.75,n)
+                c_early=.8+front*(1.05 if mode=="NATURAL" else 2.15 if mode=="HIGH_PRESSURE" else .55)
+                c_early+=pressure*.55
+                trapped=rng.random(n)<trapped_p
+                wide=rng.random(n)<wide_p
+                c_corner1=.45+trapped*rng.uniform(.35,1.0,n)+wide*rng.uniform(.35,1.15,n)+outer*.025
+                demand=(1.0 if mode=="NATURAL" else 1.85 if mode=="HIGH_PRESSURE" else .70)+front*.75+pressure*.28
+                overload=np.maximum(0,demand-cruise/5.4)
+                c_cruise=1.55+demand*.62+overload**2
+                rec=(1-front)*recovery/10*rng.uniform(.25,.85,n)
+                if mode=="LOW_PRESSURE_FRONT":
+                    rec+=front*recovery/10*rng.uniform(.35,.75,n)
+                c_third=.65+np.maximum(0,(6-corner))*.18
+                c_third+=np.where(rank<target,.65,.25)+rng.uniform(.15,.55,n)
+                c_fourth=.70+pressure*.18+np.maximum(0,5.5-corner)*.15
+                total_cons=np.maximum(0,c_start+c_early+c_corner1+c_cruise+c_third+c_fourth-rec)
+                # 前列高圧時の非線形二段負荷
+                if mode=="HIGH_PRESSURE":
+                    total_cons+=np.maximum(0,pressure-1.5)**2*.48
+                energy=np.clip(100-total_cons,0,100)
+                for i,r in d.iterrows():
+                    a=acc[int(r["馬番"])]
+                    for k,v in [("rank",rank[i]),("energy",energy[i]),("cons",total_cons[i]),
+                                ("pressure",pressure[i]),("start",c_start[i]),("early",c_early[i]),
+                                ("corner1",c_corner1[i]),("cruise",c_cruise[i]),
+                                ("third",c_third[i]),("fourth",c_fourth[i])]:
+                        a[k].append(float(v))
+        for _,r in d.iterrows():
+            no=int(r["馬番"]); a=acc[no]
+            results.append({"シナリオ":sid,"馬番":no,"馬名":r["馬名"],
+                "OADP位置帯":r["OADP位置帯"],"OADP目標4角位置":r["OADP目標4角位置"],
+                "4角順位平均":np.mean(a["rank"]),"4角順位SD":np.std(a["rank"]),
+                "4角先頭率":np.mean(np.array(a["rank"])==1),
+                "4角3位内率":np.mean(np.array(a["rank"])<=3),
+                "残存エネルギー平均":np.mean(a["energy"]),
+                "残存エネルギーP10":np.percentile(a["energy"],10),
+                "残存エネルギーP90":np.percentile(a["energy"],90),
+                "消耗率平均":np.mean(a["cons"]),
+                "消耗率SD":np.std(a["cons"]),
+                "累積圧力平均":np.mean(a["pressure"]),
+                "シナリオ発生確率":r["シナリオ発生確率"],
+                "圧力モード":r["圧力モード"]})
+            components.append({"シナリオ":sid,"馬番":no,"馬名":r["馬名"],
+                "発馬消耗":np.mean(a["start"]),"序盤位置取り消耗":np.mean(a["early"]),
+                "1角消耗":np.mean(a["corner1"]),"巡航消耗":np.mean(a["cruise"]),
+                "3角進出消耗":np.mean(a["third"]),"4角消耗":np.mean(a["fourth"]),
+                "総消耗率":np.mean(a["cons"])})
+        rr=pd.DataFrame([x for x in results if x["シナリオ"]==sid])
+        target_order=list(rr.sort_values("OADP目標4角位置")["馬番"])
+        sim_order=list(rr.sort_values("4角順位平均")["馬番"])
+        audits.append({"シナリオ":sid,"OADP先頭馬":target_order[0],"計算先頭馬":sim_order[0],
+                       "先頭一致":target_order[0]==sim_order[0],
+                       "順位相関":rr["OADP目標4角位置"].corr(rr["4角順位平均"]),
+                       "判定":"OK" if target_order[0]==sim_order[0] and rr["OADP目標4角位置"].corr(rr["4角順位平均"])>=.90 else "NG"})
+    res=pd.DataFrame(results); comp=pd.DataFrame(components); aud=pd.DataFrame(audits)
+    # 発生確率加重の統合消耗
+    weighted=(res.assign(_w=lambda x:x["シナリオ発生確率"])
+              .groupby(["馬番","馬名"],as_index=False)
+              .apply(lambda g:pd.Series({
+                  "統合消耗率":np.average(g["消耗率平均"],weights=g["_w"]),
+                  "統合残存エネルギー":np.average(g["残存エネルギー平均"],weights=g["_w"]),
+                  "統合4角順位":np.average(g["4角順位平均"],weights=g["_w"])
+              }),include_groups=False).reset_index(drop=True))
+    return res,comp,aud,weighted
+
 def audit(res,inp,event_log,branches):
     rows=[]
     for a,b in [("S1","S2"),("S1","S3"),("S2","S3")]:
@@ -847,6 +1057,66 @@ with tabs[2]:
       ok,msg=validate_base(st.session_state["base"])
       if not ok:
         st.error(msg)
+      st.markdown("### OADP Phase0〜3シナリオ契約")
+      st.caption("AIが作成したPhase0〜3 TXTをアップロードすると、4角隊列を上位契約として固定し、その内部で消耗率・残存エネルギー・累積圧力をMonte Carlo算出します。")
+      phase_file=st.file_uploader("OADP Phase0〜3 TXT",type=["txt"],key="oadp_phase_contract")
+      anchor_strength=st.slider("OADP 4角構造の拘束強度",0.70,0.99,0.90,0.01,
+                                help="高いほどAI/OADPの4角隊列を保持し、局所的な揺らぎだけを許します。")
+      if phase_file is not None:
+        try:
+          phase_text=phase_file.getvalue().decode("utf-8",errors="replace")
+          contract,contract_meta=parse_oadp_phase_contract(phase_text,st.session_state["base"])
+          st.session_state["oadp_contract"]=contract
+          st.session_state["oadp_contract_meta"]=contract_meta
+          st.success("OADPシナリオ契約を抽出しました。")
+          st.dataframe(contract_meta,use_container_width=True)
+          st.dataframe(contract.sort_values(["シナリオ","OADP目標4角位置"]),use_container_width=True)
+        except Exception as e:
+          st.session_state.pop("oadp_contract",None)
+          st.session_state.pop("oadp_contract_meta",None)
+          st.error(f"OADPシナリオ契約の抽出に失敗しました: {type(e).__name__}: {e}")
+
+      if st.button("OADP契約から消耗率を算出",type="primary",
+                   disabled=(not ok or "oadp_contract" not in st.session_state)):
+        try:
+          rr,cc,aa,ww=simulate_from_oadp_contract(
+              st.session_state["base"],st.session_state["oadp_contract"],
+              trials=trials,seeds=seeds,anchor_strength=anchor_strength)
+          st.session_state.update(contract_result=rr,contract_components=cc,
+                                  contract_audit=aa,contract_weighted=ww)
+        except Exception as e:
+          st.error(f"OADP契約シミュレーションに失敗しました: {type(e).__name__}: {e}")
+
+      if "contract_result" in st.session_state:
+        st.subheader("OADP契約シミュレーション結果")
+        st.dataframe(st.session_state["contract_result"].sort_values(["シナリオ","4角順位平均"]),use_container_width=True)
+        st.subheader("区間別消耗内訳")
+        st.dataframe(st.session_state["contract_components"].sort_values(["シナリオ","総消耗率"],ascending=[True,False]),use_container_width=True)
+        st.subheader("シナリオ確率加重・統合消耗")
+        st.dataframe(st.session_state["contract_weighted"].sort_values("統合消耗率",ascending=False),use_container_width=True)
+        st.subheader("OADP隊列保持監査")
+        st.dataframe(st.session_state["contract_audit"],use_container_width=True)
+        if st.session_state["contract_audit"]["判定"].eq("NG").any():
+          st.error("OADP隊列保持監査NGです。拘束強度を上げるか、TXTの4角位置記述を確認してください。")
+        export_contract={
+          "race":st.session_state.get("race",{}),
+          "contract_meta":st.session_state.get("oadp_contract_meta",pd.DataFrame()).to_dict("records"),
+          "contract":st.session_state["oadp_contract"].to_dict("records"),
+          "results":st.session_state["contract_result"].to_dict("records"),
+          "consumption_components":st.session_state["contract_components"].to_dict("records"),
+          "weighted":st.session_state["contract_weighted"].to_dict("records"),
+          "audit":st.session_state["contract_audit"].to_dict("records"),
+          "notice":"OADPの4角構造を上位契約とし、消耗率はDERIVED/SCENARIO_ESTIMATE"
+        }
+        st.download_button("OADP契約・消耗結果JSON",
+          json.dumps(export_contract,ensure_ascii=False,indent=2).encode("utf-8"),
+          "oadp_contract_consumption.json","application/json")
+        st.download_button("OADP契約・消耗結果CSV",
+          st.session_state["contract_result"].to_csv(index=False).encode("utf-8-sig"),
+          "oadp_contract_consumption.csv","text/csv")
+
+      st.divider()
+      st.markdown("### 自動生成シナリオ（従来モード）")
       if st.button("S1/S2/S3生成・実行",type="primary",disabled=not ok):
         try:
           b,w=worlds(st.session_state["base"]); i=scenario_inputs(b,w); r,e,br=simulate(i,trials,seeds); a=audit(r,i,e,br)
